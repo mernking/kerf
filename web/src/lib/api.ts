@@ -584,6 +584,10 @@ export const api = {
 
   // ---- Models ----
   listModels: () => request<unknown[]>('/api/models'),
+  fetchProviderModels: (provider: string) =>
+    request<{ models: Array<{ id: string; label: string; provider: string; context_window: number | null }> }>(
+      `/api/providers/${encodeURIComponent(provider)}/models`,
+    ),
 
   // Chunked, resumable binary upload (Phase 2). Used for STEP files; see
   // ROADMAP.md "Performance roadmap". Computes a SHA-256 of the file, asks the backend for a

@@ -410,13 +410,27 @@ class Registry:
         return len(self.providers) > 0
 
     def resolve(self, model_id: str) -> tuple[Provider, str]:
+        # First try the CATALOG lookup (the common path).
         info = lookup_model(model_id)
-        if info is None:
-            raise ValueError(f"unknown model {model_id!r}")
-        provider = self.providers.get(info["provider"])
-        if provider is None:
-            raise ValueError(f"provider {info['provider']!r} for model {model_id!r} is not configured")
-        return provider, info["id"]
+        if info is not None:
+            provider = self.providers.get(info["provider"])
+            if provider is None:
+                raise ValueError(
+                    f"provider {info['provider']!r} for model {model_id!r} is not configured"
+                )
+            return provider, info["id"]
+
+        # Not in CATALOG — check if the model has a provider prefix
+        # (e.g. "openai/gpt-4o" from a BYO endpoint). This lets users
+        # pick models returned by their gateway that Kerf's CATALOG
+        # never heard of.
+        if "/" in model_id:
+            provider_name = model_id.split("/", 1)[0]
+            provider = self.providers.get(provider_name)
+            if provider is not None:
+                return provider, model_id
+
+        raise ValueError(f"unknown model {model_id!r}")
 
 
 # ════════════════════════════════════════════════════════════════════════════

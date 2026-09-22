@@ -1,57 +1,73 @@
-import re
-import secrets
+import asyncio
+import base64
 import hashlib
 import hmac
-import base64
-import bcrypt
+import io
 import json
 import logging
 import os
-import asyncio
+import re
+import secrets
 import time
 import uuid
-import io
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Any
-
-import asyncpg
-import httpx
-import jwt
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Response, Cookie, UploadFile, Form, Query
-from fastapi.responses import StreamingResponse, RedirectResponse
-from pydantic import BaseModel
+from typing import Any, Optional
 from urllib.parse import urlencode
 
-from kerf_core.db.errors import is_unique_violation
+import asyncpg
+import bcrypt
+import httpx
+import jwt
+from fastapi import (
+    APIRouter,
+    Cookie,
+    Depends,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.responses import RedirectResponse, StreamingResponse
+from kerf_chat import llm as llm_module
+from kerf_chat.tools.executor import execute as tools_execute
+from kerf_chat.tools.executor import specs as tools_specs
 from kerf_core.config import get_settings
 from kerf_core.db.connection import get_pool_required
-from kerf_core.db.queries import workspaces as workspaces_queries
-from kerf_core.db.queries import projects as projects_queries
-from kerf_core.db.queries import files as files_queries
+from kerf_core.db.errors import is_unique_violation
 from kerf_core.db.queries import api_tokens as api_tokens_queries
-from kerf_core.db.queries import refresh_tokens as rt_queries
 from kerf_core.db.queries import chat_threads as threads_queries
-from kerf_core.db.queries import share_links as share_links_queries
 from kerf_core.db.queries import derived_artifacts as da_queries
+from kerf_core.db.queries import files as files_queries
 from kerf_core.db.queries import jobs as jobs_queries
-from kerf_core.db.queries import usage_events as usage_queries
-from kerf_core.db.queries import upload_sessions as uploads_queries
 from kerf_core.db.queries import library as library_queries
-from kerf_core.dependencies import require_auth, require_node_owner, optional_auth, rate_limit
+from kerf_core.db.queries import projects as projects_queries
+from kerf_core.db.queries import refresh_tokens as rt_queries
+from kerf_core.db.queries import share_links as share_links_queries
+from kerf_core.db.queries import upload_sessions as uploads_queries
+from kerf_core.db.queries import usage_events as usage_queries
+from kerf_core.db.queries import workspaces as workspaces_queries
+from kerf_core.dependencies import (
+    optional_auth,
+    rate_limit,
+    require_auth,
+    require_node_owner,
+)
 from kerf_core.storage import get_storage_required
 from kerf_core.storage.materialize import blob_storage_key
-from kerf_chat import llm as llm_module
-from kerf_chat.tools.executor import execute as tools_execute, specs as tools_specs
 from kerf_core.utils.context import ProjectCtx
 from kerf_tess.worker import notify_step_uploaded
+from pydantic import BaseModel
 
 router = APIRouter()
 LARGE_STEP_THRESHOLD = 5 * 1024 * 1024
 settings = get_settings()
 
-slug_re = re.compile(r'^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$')
+slug_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$")
 
 
 def slug_from_name(name: str) -> str:
@@ -62,15 +78,15 @@ def slug_from_name(name: str) -> str:
         if r.isalnum():
             b.append(r)
             prev_dash = False
-        elif r in ' _-':
+        elif r in " _-":
             if not prev_dash and b:
-                b.append('-')
+                b.append("-")
                 prev_dash = True
-    out = ''.join(b).strip('-')
+    out = "".join(b).strip("-")
     if len(out) > 32:
         out = out[:32]
     if len(out) < 3:
-        out = out + 'x' * (3 - len(out))
+        out = out + "x" * (3 - len(out))
     return out
 
 
@@ -108,7 +124,7 @@ def hash_token(token: str) -> str:
 
 
 def random_nonce() -> str:
-    return base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip('=')
+    return base64.urlsafe_b64encode(secrets.token_bytes(16)).decode().rstrip("=")
 
 
 def generate_id() -> str:
@@ -124,34 +140,39 @@ def require_project_owner(request: Request, pid: str, uid: str) -> bool:
     return True
 
 
-async def workspace_role_by_id(workspace_id: str, user_id: str) -> tuple[Optional[str], bool]:
+async def workspace_role_by_id(
+    workspace_id: str, user_id: str
+) -> tuple[Optional[str], bool]:
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-            workspace_id, user_id
+            workspace_id,
+            user_id,
         )
         if row:
-            return row['role'], True
+            return row["role"], True
         return None, True
 
 
-async def get_user_workspace_role(conn: asyncpg.Connection, workspace_id: str, user_id: str) -> Optional[str]:
+async def get_user_workspace_role(
+    conn: asyncpg.Connection, workspace_id: str, user_id: str
+) -> Optional[str]:
     row = await conn.fetchrow(
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-        workspace_id, user_id
+        workspace_id,
+        user_id,
     )
-    return row['role'] if row else None
+    return row["role"] if row else None
 
 
 async def project_workspace_id(pid: str) -> Optional[str]:
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT workspace_id FROM projects WHERE id = $1",
-            pid
+            "SELECT workspace_id FROM projects WHERE id = $1", pid
         )
-        return str(row['workspace_id']) if row else None
+        return str(row["workspace_id"]) if row else None
 
 
 async def get_workspace_by_slug(slug: str) -> Optional[dict]:
@@ -160,18 +181,26 @@ async def get_workspace_by_slug(slug: str) -> Optional[dict]:
         return await workspaces_queries.get_workspace_by_slug(conn, slug)
 
 
-async def create_personal_workspace(conn: asyncpg.Connection, user_id: str, display_name: str) -> Optional[dict]:
+async def create_personal_workspace(
+    conn: asyncpg.Connection, user_id: str, display_name: str
+) -> Optional[dict]:
     slug = f"personal-{user_id[:8]}-{secrets.token_hex(4)}"
     slug = slug.lower()
     try:
-        workspace = await workspaces_queries.create_workspace(conn, slug, display_name, user_id)
-        await workspaces_queries.add_workspace_member(conn, workspace['id'], user_id, "owner")
+        workspace = await workspaces_queries.create_workspace(
+            conn, slug, display_name, user_id
+        )
+        await workspaces_queries.add_workspace_member(
+            conn, workspace["id"], user_id, "owner"
+        )
         return workspace
     except Exception:
         return None
 
 
-async def get_default_workspace(conn: asyncpg.Connection, user_id: str) -> tuple[Optional[dict], bool]:
+async def get_default_workspace(
+    conn: asyncpg.Connection, user_id: str
+) -> tuple[Optional[dict], bool]:
     row = await conn.fetchrow(
         """
         SELECT w.* FROM workspaces w
@@ -204,7 +233,9 @@ def user_to_response(user: dict) -> dict:
         "avatar_url": user.get("avatar_url") or "",
         "account_role": user["account_role"],
         "is_system": user["is_system"],
-        "created_at": user["created_at"].isoformat() if isinstance(user["created_at"], datetime) else user["created_at"],
+        "created_at": user["created_at"].isoformat()
+        if isinstance(user["created_at"], datetime)
+        else user["created_at"],
     }
 
 
@@ -214,7 +245,9 @@ def workspace_to_response(ws: dict) -> dict:
         "slug": ws["slug"],
         "name": ws["name"],
         "avatar_url": ws.get("avatar_url"),
-        "created_at": ws["created_at"].isoformat() if isinstance(ws["created_at"], datetime) else ws["created_at"],
+        "created_at": ws["created_at"].isoformat()
+        if isinstance(ws["created_at"], datetime)
+        else ws["created_at"],
         "my_role": ws.get("my_role"),
         "member_count": ws.get("member_count"),
         "project_count": ws.get("project_count"),
@@ -278,14 +311,18 @@ async def me(payload: dict = Depends(require_auth)):
             user_id,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+            )
 
         user = dict(row)
         default_ws, _ = await get_default_workspace(conn, str(user["id"]))
 
         return {
             **user_to_response(user),
-            "default_workspace": workspace_to_response(default_ws) if default_ws else None,
+            "default_workspace": workspace_to_response(default_ws)
+            if default_ws
+            else None,
         }
 
 
@@ -305,7 +342,8 @@ async def update_me(req: UpdateMeRequest, payload: dict = Depends(require_auth))
                 UPDATE users SET name = $2 WHERE id = $1
                 RETURNING id, email, name, avatar_url, account_role, is_system, created_at
                 """,
-                user_id, name,
+                user_id,
+                name,
             )
         else:
             row = await conn.fetchrow(
@@ -314,18 +352,18 @@ async def update_me(req: UpdateMeRequest, payload: dict = Depends(require_auth))
             )
 
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+            )
 
         return user_to_response(dict(row))
 
 
 @router.get("/models")
-async def list_models():
-    # Dynamic: the registry exposes the model CATALOG filtered to the
-    # providers whose API key is actually configured (anthropic / openai
-    # / moonshot / gemini). So adding an OpenAI/Gemini key makes those
-    # models appear without code changes. (Was a hard-coded
-    # Anthropic-only list — that's why only Anthropic showed.)
+async def list_models(payload: dict = Depends(optional_auth)):
+    # Start with the static CATALOG filtered to providers whose API key is
+    # configured on this node (operator keys). This gives every installed
+    # node a working model picker even if no BYO key is saved.
     reg = _get_llm_registry()
     models = [
         {
@@ -337,14 +375,116 @@ async def list_models():
         }
         for m in reg.available()
     ]
+
+    # When the caller is authenticated and has BYO provider keys with a
+    # custom base_url, fetch the model list from those endpoints and merge.
+    # This replaces the hardcoded CATALOG for OpenAI-compatible gateways
+    # (OmniRouter, LiteLLM, vLLM, etc.) — the user sees exactly what the
+    # endpoint offers.
+    user_id = payload.get("sub") if payload else None
+    if user_id:
+        await _merge_byo_models(user_id, models)
+
     if not models:
         # No provider keys configured at all — keep the dropdown
         # non-empty; resolve() still errors gracefully if picked.
-        models = [{
-            "id": reg.default(), "name": reg.default(),
-            "label": reg.default(), "provider": "anthropic",
-        }]
+        models = [
+            {
+                "id": reg.default(),
+                "name": reg.default(),
+                "label": reg.default(),
+                "provider": "anthropic",
+            }
+        ]
     return {"models": models}
+
+
+async def _merge_byo_models(user_id: str, models: list[dict]) -> None:
+    """Fetch models from each BYO provider endpoint and merge into *models*.
+
+    For each provider where the user has saved a key with a base_url, we
+    call the provider's /v1/models endpoint and replace any CATALOG models
+    for that provider with the live list. Models from providers without a
+    base_url (direct vendor keys) are left as-is in the CATALOG — the
+    vendor's own /v1/models may not exist (Anthropic) or may return models
+    that differ from what the CATALOG tracks.
+    """
+    from kerf_core.utils.encrypt import decrypt_secret
+
+    pool = await get_pool_required()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT provider, encrypted_key, base_url FROM user_provider_keys WHERE user_id = $1",
+            user_id,
+        )
+
+    for row in rows:
+        provider = row["provider"]
+        base_url = (row["base_url"] or "").strip().rstrip("/")
+        if not base_url:
+            # Direct vendor key — keep CATALOG models, skip fetch.
+            continue
+
+        try:
+            api_key = decrypt_secret(row["encrypted_key"], "byo-provider-key").decode()
+        except Exception:
+            continue
+
+        # Build the models endpoint URL.
+        if provider == "openai":
+            models_url = f"{base_url}/models"
+        elif provider == "gemini":
+            models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        elif provider == "moonshot":
+            models_url = "https://api.moonshot.cn/v1/models"
+        else:
+            continue
+
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                headers = {} if provider == "gemini" else {"Authorization": f"Bearer {api_key}"}
+                resp = await client.get(models_url, headers=headers)
+            if resp.status_code >= 400:
+                continue
+
+            data = resp.json()
+            fetched: list[dict] = []
+
+            if provider == "gemini":
+                for m in data.get("models", []):
+                    name = m.get("name", "")
+                    model_id = name.replace("models/", "")
+                    if model_id:
+                        # Prefix with provider so registry.resolve() can
+                        # find the provider even though this model is not
+                        # in the hardcoded CATALOG.
+                        prefixed_id = f"{provider}/{model_id}"
+                        fetched.append({
+                            "id": prefixed_id,
+                            "label": m.get("displayName") or model_id,
+                            "provider": provider,
+                            "context_window": m.get("inputTokenLimit"),
+                        })
+            else:
+                for m in data.get("data", []):
+                    mid = m.get("id", "")
+                    if mid:
+                        # Prefix with provider for the same reason as above.
+                        prefixed_id = f"{provider}/{mid}" if "/" not in mid else mid
+                        fetched.append({
+                            "id": prefixed_id,
+                            "label": mid,
+                            "provider": provider,
+                            "context_window": None,
+                        })
+
+            if fetched:
+                # Remove CATALOG models for this provider and add the live ones.
+                models[:] = [m for m in models if m.get("provider") != provider]
+                models.extend(fetched)
+        except Exception:
+            _logger.debug("byo_models: failed to fetch from %s", provider)
+            continue
 
 
 # ── BYO provider-key management (R13, T-402b) ────────────────────────────────
@@ -374,7 +514,12 @@ def _mask_api_key(plaintext: str) -> str:
     return "••••" + plaintext[-4:]
 
 
-async def _validate_provider_key(provider: str, api_key: str) -> None:
+# async def _validate_provider_key(provider: str, api_key: str) -> None:
+async def _validate_provider_key(
+    provider: str,
+    api_key: str,
+    base_url: str = "",
+) -> None:
     """Make a minimal live call to *provider* using *api_key*.
 
     Raises HTTPException(422) with detail="provider_key_invalid" on any
@@ -404,16 +549,47 @@ async def _validate_provider_key(provider: str, api_key: str) -> None:
                 # Non-auth error that looks like a bad key (e.g. 400 with wrong format)
                 raise HTTPException(status_code=422, detail="provider_key_invalid")
 
+        # elif provider == "openai":
+        #     async with httpx.AsyncClient(timeout=10.0) as client:
+        #         resp = await client.get(
+        #             "https://api.openai.com/v1/models",
+        #             headers={"Authorization": f"Bearer {api_key}"},
+        #         )
+        #     if resp.status_code in (401, 403):
+        #         raise HTTPException(status_code=422, detail="provider_key_invalid")
+        #     if resp.status_code >= 400 and resp.status_code not in (529, 500, 503):
+        #         raise HTTPException(status_code=422, detail="provider_key_invalid")
+
         elif provider == "openai":
+            # If the user supplied a base_url, this is an OpenAI-compatible
+            # endpoint (e.g. OmniRouter, LiteLLM, vLLM, Ollama, etc.).
+            #
+            # Validate against that endpoint instead of blindly contacting
+            # api.openai.com.
+            endpoint = (base_url or "").strip().rstrip("/")
+
+            if endpoint:
+                models_url = f"{endpoint}/models"
+            else:
+                models_url = "https://api.openai.com/v1/models"
+
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
-                    "https://api.openai.com/v1/models",
+                    models_url,
                     headers={"Authorization": f"Bearer {api_key}"},
                 )
+
             if resp.status_code in (401, 403):
-                raise HTTPException(status_code=422, detail="provider_key_invalid")
+                raise HTTPException(
+                    status_code=422,
+                    detail="provider_key_invalid",
+                )
+
             if resp.status_code >= 400 and resp.status_code not in (529, 500, 503):
-                raise HTTPException(status_code=422, detail="provider_key_invalid")
+                raise HTTPException(
+                    status_code=422,
+                    detail="provider_key_invalid",
+                )
 
         elif provider == "moonshot":
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -442,7 +618,9 @@ async def _validate_provider_key(provider: str, api_key: str) -> None:
     except HTTPException:
         raise
     except Exception:
-        _logger.exception("provider_key_validation: network error for provider=%s", provider)
+        _logger.exception(
+            "provider_key_validation: network error for provider=%s", provider
+        )
         raise HTTPException(status_code=422, detail="provider_key_validation_failed")
 
 
@@ -471,10 +649,16 @@ async def save_provider_key(
         raise HTTPException(status_code=422, detail="provider_key_invalid")
 
     # Validate key against the live provider before storing.
-    await _validate_provider_key(provider, api_key)
+    # await _validate_provider_key(provider, api_key)
+    await _validate_provider_key(
+        provider,
+        api_key,
+        req.base_url,
+    )
 
     # Encrypt and upsert.
     from kerf_core.utils.encrypt import encrypt_secret
+
     encrypted = encrypt_secret(api_key.encode(), "byo-provider-key")
     base_url = req.base_url.strip() or None
 
@@ -489,7 +673,10 @@ async def save_provider_key(
                           base_url      = EXCLUDED.base_url,
                           created_at    = now()
             """,
-            user_id, provider, encrypted, base_url,
+            user_id,
+            provider,
+            encrypted,
+            base_url,
         )
 
     return {
@@ -551,12 +738,14 @@ async def list_provider_keys(payload: dict = Depends(require_auth)):
     # their own still gets a working model picker through these, and the UI
     # should say so rather than showing four empty boxes and no explanation.
     operator_configured = sorted(
-        name for name, key in (
+        name
+        for name, key in (
             ("anthropic", settings.anthropic_api_key),
             ("openai", settings.openai_api_key),
             ("moonshot", settings.moonshot_api_key),
             ("gemini", settings.gemini_api_key),
-        ) if key
+        )
+        if key
     )
 
     return {
@@ -564,6 +753,110 @@ async def list_provider_keys(payload: dict = Depends(require_auth)):
         "supported_providers": sorted(_BYO_SUPPORTED_PROVIDERS),
         "operator_configured": operator_configured,
     }
+
+
+@router.get("/providers/{provider}/models")
+async def fetch_provider_models(
+    provider: str,
+    payload: dict = Depends(require_auth),
+):
+    """Fetch available models from a provider's /v1/models endpoint.
+
+    Uses the user's saved BYO key and base_url for the request. This lets
+    the model picker show exactly what models the endpoint offers — no
+    hardcoded catalogue. If the user has no saved key or the endpoint is
+    unreachable, returns an empty list (the UI falls back to the static
+    catalogue).
+    """
+    user_id = payload.get("sub")
+    provider = provider.strip().lower()
+
+    if provider not in _BYO_SUPPORTED_PROVIDERS:
+        return {"models": []}
+
+    pool = await get_pool_required()
+    from kerf_core.utils.encrypt import decrypt_secret
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT encrypted_key, base_url FROM user_provider_keys WHERE user_id = $1 AND provider = $2",
+            user_id,
+            provider,
+        )
+    if not row:
+        return {"models": []}
+
+    try:
+        api_key = decrypt_secret(row["encrypted_key"], "byo-provider-key").decode()
+    except Exception:
+        return {"models": []}
+
+    base_url = (row["base_url"] or "").strip().rstrip("/")
+
+    # Determine the models endpoint.
+    if provider == "openai" and base_url:
+        # OpenAI-compatible gateway (OmniRouter, LiteLLM, vLLM, etc.)
+        models_url = f"{base_url}/models"
+    elif provider == "gemini":
+        models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    elif provider == "moonshot":
+        models_url = "https://api.moonshot.cn/v1/models"
+    elif provider == "anthropic":
+        # Anthropic has no /models endpoint; return empty so the UI
+        # falls back to the CATALOG for Claude models.
+        return {"models": []}
+    else:
+        models_url = "https://api.openai.com/v1/models"
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                models_url,
+                headers={"Authorization": f"Bearer {api_key}"} if provider != "gemini" else {},
+            )
+        if resp.status_code >= 400:
+            return {"models": []}
+
+        data = resp.json()
+
+        # Normalise the response to a common shape.
+        # OpenAI / OpenAI-compatible: { "data": [{"id": "gpt-4o", ...}] }
+        # Gemini: { "models": [{"name": "models/gemini-2.5-pro", ...}] }
+        models = []
+        if provider == "gemini":
+            for m in data.get("models", []):
+                name = m.get("name", "")
+                # Strip "models/" prefix for display
+                model_id = name.replace("models/", "")
+                if model_id:
+                    # Prefix with provider so registry.resolve() can
+                    # find the provider even though this model is not
+                    # in the hardcoded CATALOG.
+                    prefixed_id = f"{provider}/{model_id}"
+                    models.append({
+                        "id": prefixed_id,
+                        "label": m.get("displayName") or model_id,
+                        "provider": provider,
+                        "context_window": m.get("inputTokenLimit"),
+                    })
+        else:
+            # OpenAI-compatible shape (works for OpenAI, OmniRouter, etc.)
+            for m in data.get("data", []):
+                mid = m.get("id", "")
+                if mid:
+                    # Prefix with provider for the same reason as above.
+                    prefixed_id = f"{provider}/{mid}" if "/" not in mid else mid
+                    models.append({
+                        "id": prefixed_id,
+                        "label": mid,
+                        "provider": provider,
+                        "context_window": None,
+                    })
+
+        return {"models": models}
+    except Exception:
+        _logger.debug("provider_models: failed to fetch from %s", provider)
+        return {"models": []}
 
 
 @router.get("/usage")
@@ -741,7 +1034,8 @@ async def delete_provider_key(
     async with pool.acquire() as conn:
         result = await conn.execute(
             "DELETE FROM user_provider_keys WHERE user_id = $1 AND provider = $2",
-            user_id, provider,
+            user_id,
+            provider,
         )
 
     # asyncpg execute returns a command tag string like "DELETE 1"
@@ -753,6 +1047,7 @@ async def delete_provider_key(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @router.get("/share/{token}")
 async def lookup_share(token: str, payload: Optional[dict] = Depends(optional_auth)):
@@ -769,12 +1064,16 @@ async def lookup_share(token: str, payload: Optional[dict] = Depends(optional_au
             token,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="share not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="share not found"
+            )
 
         if row["max_uses"]:
             try:
                 if int(row["uses"]) >= int(row["max_uses"]):
-                    raise HTTPException(status_code=status.HTTP_410_GONE, detail="share link expired")
+                    raise HTTPException(
+                        status_code=status.HTTP_410_GONE, detail="share link expired"
+                    )
             except (ValueError, TypeError):
                 pass
 
@@ -797,7 +1096,9 @@ async def accept_share(token: str, payload: dict = Depends(require_auth)):
             token,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="share not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="share not found"
+            )
 
         # Resolve the project's workspace — share_links.project_id is not a workspace_id
         ws_row = await conn.fetchrow(
@@ -805,12 +1106,16 @@ async def accept_share(token: str, payload: dict = Depends(require_auth)):
             row["project_id"],
         )
         if not ws_row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         ws_id = str(ws_row["workspace_id"])
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="forbidden"
+            )
 
         return {"role": role}
 
@@ -843,7 +1148,9 @@ def _default_state_path() -> Optional[str]:
 def _friendly_llm_error(provider_name: str, err: Exception) -> str:
     msg = str(err).lower()
     if "rate limit" in msg or "429" in msg:
-        return "The model provider rate-limited the request. Please try again in a moment."
+        return (
+            "The model provider rate-limited the request. Please try again in a moment."
+        )
     if "401" in msg or "unauthorized" in msg or "invalid api key" in msg:
         return "The provider rejected the API key. Check the server's environment variables."
     if "context" in msg and "length" in msg:
@@ -871,13 +1178,15 @@ def _friendly_llm_error(provider_name: str, err: Exception) -> str:
 
 
 def _get_llm_registry() -> llm_module.Registry:
-    return llm_module.Registry(llm_module.LLMConfig(
-        anthropic_api_key=settings.anthropic_api_key,
-        openai_api_key=settings.openai_api_key,
-        moonshot_api_key=settings.moonshot_api_key,
-        gemini_api_key=settings.gemini_api_key,
-        default_model=settings.default_model,
-    ))
+    return llm_module.Registry(
+        llm_module.LLMConfig(
+            anthropic_api_key=settings.anthropic_api_key,
+            openai_api_key=settings.openai_api_key,
+            moonshot_api_key=settings.moonshot_api_key,
+            gemini_api_key=settings.gemini_api_key,
+            default_model=settings.default_model,
+        )
+    )
 
 
 async def _prefer_byo_provider(pool, user_id: Optional[str], provider):
@@ -893,6 +1202,7 @@ async def _prefer_byo_provider(pool, user_id: Optional[str], provider):
         return provider
     try:
         from kerf_core.utils.encrypt import decrypt_secret
+
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -900,7 +1210,8 @@ async def _prefer_byo_provider(pool, user_id: Optional[str], provider):
                 FROM user_provider_keys
                 WHERE user_id = $1 AND provider = $2
                 """,
-                user_id, provider.name(),
+                user_id,
+                provider.name(),
             )
         if not row:
             return provider
@@ -967,7 +1278,9 @@ async def list_workspaces(payload: dict = Depends(require_auth)):
         )
 
         if not rows:
-            user_row = await conn.fetchrow("SELECT name, email FROM users WHERE id = $1", user_id)
+            user_row = await conn.fetchrow(
+                "SELECT name, email FROM users WHERE id = $1", user_id
+            )
             display = user_row["name"].strip() if user_row else ""
             if not display:
                 email = user_row["email"] if user_row else ""
@@ -997,28 +1310,40 @@ class CreateWorkspaceRequest(BaseModel):
 
 
 @router.post("/workspaces")
-async def create_workspace(req: CreateWorkspaceRequest, payload: dict = Depends(require_auth)):
+async def create_workspace(
+    req: CreateWorkspaceRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     name = req.name.strip()
     if not name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="name is required"
+        )
 
     slug = req.slug.strip().lower() if req.slug else slug_from_name(name)
     if not slug_re.match(slug):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid slug")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid slug"
+        )
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         async with conn.transaction():
             try:
-                workspace = await workspaces_queries.create_workspace(conn, slug, name, user_id)
+                workspace = await workspaces_queries.create_workspace(
+                    conn, slug, name, user_id
+                )
             except Exception as exc:
                 if not is_unique_violation(exc):
                     raise
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="slug already in use")
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail="slug already in use"
+                )
 
-            await workspaces_queries.add_workspace_member(conn, workspace["id"], user_id, "owner")
+            await workspaces_queries.add_workspace_member(
+                conn, workspace["id"], user_id, "owner"
+            )
 
             workspace["my_role"] = "owner"
             workspace["member_count"] = 1
@@ -1026,18 +1351,24 @@ async def create_workspace(req: CreateWorkspaceRequest, payload: dict = Depends(
 
 
 @router.get("/workspaces/{slug}")
-async def get_workspace(slug: str, request: Request, payload: dict = Depends(require_auth)):
+async def get_workspace(
+    slug: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws = await workspaces_queries.get_workspace_by_slug(conn, slug)
         if not ws:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         role = await get_user_workspace_role(conn, str(ws["id"]), user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         members = await workspaces_queries.list_workspace_members(conn, ws["id"])
 
@@ -1062,30 +1393,41 @@ class UpdateWorkspaceRequest(BaseModel):
 
 
 @router.patch("/workspaces/{slug}")
-async def update_workspace(slug: str, req: UpdateWorkspaceRequest, payload: dict = Depends(require_auth)):
+async def update_workspace(
+    slug: str, req: UpdateWorkspaceRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws = await workspaces_queries.get_workspace_by_slug(conn, slug)
         if not ws:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         role = await get_user_workspace_role(conn, str(ws["id"]), user_id)
         if not role or role not in ("owner", "admin"):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="owner or admin required")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="owner or admin required"
+            )
 
         updates = {}
         if req.name is not None:
             name = req.name.strip()
             if not name:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name cannot be empty")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="name cannot be empty",
+                )
             updates["name"] = name
 
         if req.slug is not None:
             s = req.slug.strip().lower()
             if not slug_re.match(s):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid slug")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="invalid slug"
+                )
             updates["slug"] = s
 
         if updates:
@@ -1101,18 +1443,24 @@ async def update_workspace(slug: str, req: UpdateWorkspaceRequest, payload: dict
 
 
 @router.delete("/workspaces/{slug}")
-async def delete_workspace(slug: str, request: Request, payload: dict = Depends(require_auth)):
+async def delete_workspace(
+    slug: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws = await workspaces_queries.get_workspace_by_slug(conn, slug)
         if not ws:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         role = await get_user_workspace_role(conn, str(ws["id"]), user_id)
         if role != "owner":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="owner only")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="owner only"
+            )
 
         await workspaces_queries.delete_workspace(conn, ws["id"])
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1127,41 +1475,55 @@ async def serve_workspace_avatar(request: Request, id: str):
             id,
         )
         if not row or not row["avatar_storage_key"]:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+            )
 
         return Response(status_code=status.HTTP_200_OK)
 
 
 @router.post("/workspaces/{slug}/avatar")
-async def upload_workspace_avatar(slug: str, request: Request, payload: dict = Depends(require_auth)):
+async def upload_workspace_avatar(
+    slug: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws = await workspaces_queries.get_workspace_by_slug(conn, slug)
         if not ws:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         role = await get_user_workspace_role(conn, str(ws["id"]), user_id)
         if not role or role not in ("owner", "admin"):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="owner or admin required")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="owner or admin required"
+            )
 
         return {"status": "ok"}
 
 
 @router.delete("/workspaces/{slug}/avatar")
-async def delete_workspace_avatar(slug: str, request: Request, payload: dict = Depends(require_auth)):
+async def delete_workspace_avatar(
+    slug: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws = await workspaces_queries.get_workspace_by_slug(conn, slug)
         if not ws:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         role = await get_user_workspace_role(conn, str(ws["id"]), user_id)
         if not role or role not in ("owner", "admin"):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="owner or admin required")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="owner or admin required"
+            )
 
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -1299,7 +1661,7 @@ export default function ({ primitives, transforms, booleans }) {
 """
 
 
-DEFAULT_CIRCUIT = '''import { Circuit } from "tscircuit"
+DEFAULT_CIRCUIT = """import { Circuit } from "tscircuit"
 
 // Kerf: default export is a JSX element OR a Circuit instance. The editor
 // renders the schematic, PCB, and 3D views in their respective tabs.
@@ -1312,9 +1674,9 @@ export default (
     <trace from=".R2 .pin2" to=".R3 .pin1" />
   </board>
 )
-'''
+"""
 
-DEFAULT_DRAWING = '''{
+DEFAULT_DRAWING = """{
   "frame": {
     "size": "A3",
     "orientation": "landscape",
@@ -1323,7 +1685,7 @@ DEFAULT_DRAWING = '''{
   "views": [],
   "dimensions": [],
   "annotations": []
-}'''
+}"""
 
 DEFAULT_STARTER = "jscad"
 
@@ -1336,22 +1698,26 @@ DEFAULT_STARTER = "jscad"
 # their exact seeds. "blank" seeds nothing. Every kind here must be in the
 # FILE_KINDS allow-list.
 STARTER_SEEDS: dict[str, tuple[str, str, str]] = {
-    "jscad":    ("main.jscad",        "script",   default_jscad),
-    "assembly": ("main.assembly",     "assembly", '{"components":[]}'),
-    "feature":  ("main.feature",      "feature",  '{"features":[]}'),
-    "drawing":  ("main.drawing",      "drawing",  DEFAULT_DRAWING),
-    "circuit":  ("main.circuit.tsx",  "circuit",  DEFAULT_CIRCUIT),
-    "blank":    ("",                  "file",     ""),
+    "jscad": ("main.jscad", "script", default_jscad),
+    "assembly": ("main.assembly", "assembly", '{"components":[]}'),
+    "feature": ("main.feature", "feature", '{"features":[]}'),
+    "drawing": ("main.drawing", "drawing", DEFAULT_DRAWING),
+    "circuit": ("main.circuit.tsx", "circuit", DEFAULT_CIRCUIT),
+    "blank": ("", "file", ""),
 }
 
 
 @router.post("/projects")
-async def create_project(req: CreateProjectRequest, payload: dict = Depends(require_auth)):
+async def create_project(
+    req: CreateProjectRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     name = req.name.strip()
     if not name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="name is required"
+        )
 
     ws_id = req.workspace_id
     if not ws_id and req.workspace_slug:
@@ -1375,7 +1741,7 @@ async def create_project(req: CreateProjectRequest, payload: dict = Depends(requ
                 urow = await conn.fetchrow(
                     "SELECT name, email FROM users WHERE id = $1", user_id
                 )
-                display = (urow["name"].strip() if urow and urow["name"] else "")
+                display = urow["name"].strip() if urow and urow["name"] else ""
                 if not display:
                     email = urow["email"] if urow and urow["email"] else ""
                     at = email.find("@")
@@ -1392,7 +1758,9 @@ async def create_project(req: CreateProjectRequest, payload: dict = Depends(requ
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
 
         tags = list(set(t.strip() for t in req.tags if t.strip()))
 
@@ -1407,13 +1775,23 @@ async def create_project(req: CreateProjectRequest, payload: dict = Depends(requ
 
         async with conn.transaction():
             project = await projects_queries.create_project(
-                conn, ws_id, name, req.description, default_visibility, tags,
+                conn,
+                ws_id,
+                name,
+                req.description,
+                default_visibility,
+                tags,
                 created_by=payload.get("sub"),
             )
 
             if starter_name and starter_content:
                 await files_queries.create_file(
-                    conn, project["id"], starter_name, starter_kind, None, starter_content,
+                    conn,
+                    project["id"],
+                    starter_name,
+                    starter_kind,
+                    None,
+                    starter_content,
                     created_by=payload.get("sub"),
                 )
 
@@ -1428,8 +1806,10 @@ async def create_project(req: CreateProjectRequest, payload: dict = Depends(requ
 # visible in the FileTree "+ New" menu and the FILE_KINDS allow-list above.
 _IMPORT_EXT_KIND: dict[str, str] = {
     # CAD / geometry
-    ".step": "step", ".stp": "step",
-    ".iges": "iges", ".igs": "iges",
+    ".step": "step",
+    ".stp": "step",
+    ".iges": "iges",
+    ".igs": "iges",
     ".stl": "stl",
     ".3dm": "rhino",
     ".dxf": "dxf",
@@ -1446,10 +1826,15 @@ _IMPORT_EXT_KIND: dict[str, str] = {
     ".section": "section",
     ".view": "view",
     # Circuit / electronics
-    ".circuit": "circuit", ".tsx": "circuit",
-    ".spice": "spice_netlist", ".sp": "spice_netlist", ".cir": "spice_netlist",
-    ".v": "hdl_verilog", ".sv": "hdl_verilog",
-    ".vhd": "hdl_vhdl", ".vhdl": "hdl_vhdl",
+    ".circuit": "circuit",
+    ".tsx": "circuit",
+    ".spice": "spice_netlist",
+    ".sp": "spice_netlist",
+    ".cir": "spice_netlist",
+    ".v": "hdl_verilog",
+    ".sv": "hdl_verilog",
+    ".vhd": "hdl_vhdl",
+    ".vhdl": "hdl_vhdl",
     ".gds": "gds_layout",
     ".oas": "oasis_layout",
     ".lef": "lef_lib",
@@ -1484,25 +1869,54 @@ _IMPORT_EXT_KIND: dict[str, str] = {
     ".eco": "eco",
     ".sysml": "sysml",
     # Text / code (kind="text" so they open in the editor)
-    ".py": "text", ".js": "text", ".ts": "text", ".jsx": "text",
-    ".md": "text", ".txt": "text", ".csv": "text", ".json": "text",
-    ".yaml": "text", ".yml": "text", ".toml": "text", ".ini": "text",
-    ".c": "text", ".cpp": "text", ".h": "text", ".hpp": "text",
-    ".rs": "text", ".go": "text", ".java": "text", ".kt": "text",
-    ".sh": "text", ".bash": "text", ".zsh": "text",
-    ".html": "text", ".css": "text", ".xml": "text", ".svg": "text",
-    ".f90": "text", ".f": "text",
+    ".py": "text",
+    ".js": "text",
+    ".ts": "text",
+    ".jsx": "text",
+    ".md": "text",
+    ".txt": "text",
+    ".csv": "text",
+    ".json": "text",
+    ".yaml": "text",
+    ".yml": "text",
+    ".toml": "text",
+    ".ini": "text",
+    ".c": "text",
+    ".cpp": "text",
+    ".h": "text",
+    ".hpp": "text",
+    ".rs": "text",
+    ".go": "text",
+    ".java": "text",
+    ".kt": "text",
+    ".sh": "text",
+    ".bash": "text",
+    ".zsh": "text",
+    ".html": "text",
+    ".css": "text",
+    ".xml": "text",
+    ".svg": "text",
+    ".f90": "text",
+    ".f": "text",
     # Render outputs
-    ".png": "render", ".jpg": "render", ".jpeg": "render",
-    ".gif": "render", ".bmp": "render", ".tiff": "render", ".tif": "render",
-    ".exr": "render", ".hdr": "render",
+    ".png": "render",
+    ".jpg": "render",
+    ".jpeg": "render",
+    ".gif": "render",
+    ".bmp": "render",
+    ".tiff": "render",
+    ".tif": "render",
+    ".exr": "render",
+    ".hdr": "render",
     ".pdf": "file",
     # Sheet / spreadsheet
     ".sheet": "sheet",
 }
 
 _IMPORT_MAX_FILE_COUNT = 5_000
-_IMPORT_HARD_CAP_BYTES = 200 * 1024 * 1024  # 200 MB uncompressed hard cap (OWASP DoS guard)
+_IMPORT_HARD_CAP_BYTES = (
+    200 * 1024 * 1024
+)  # 200 MB uncompressed hard cap (OWASP DoS guard)
 
 
 def _kind_from_ext(filename: str) -> str:
@@ -1541,7 +1955,9 @@ async def import_project_zip(
     user_id = payload.get("sub")
     name = (name or "").strip()
     if not name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="name is required"
+        )
 
     # ── Resolve workspace ────────────────────────────────────────────────────
     ws_id = workspace_id
@@ -1558,7 +1974,7 @@ async def import_project_zip(
                 urow = await conn.fetchrow(
                     "SELECT name, email FROM users WHERE id = $1", user_id
                 )
-                display = (urow["name"].strip() if urow and urow["name"] else "")
+                display = urow["name"].strip() if urow and urow["name"] else ""
                 if not display:
                     email = urow["email"] if urow and urow["email"] else ""
                     at = email.find("@")
@@ -1575,7 +1991,9 @@ async def import_project_zip(
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workspace not found"
+            )
         if role == "viewer":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1584,6 +2002,7 @@ async def import_project_zip(
 
         # ── Stream upload to a temp file ─────────────────────────────────────
         import tempfile
+
         max_zip_bytes = max(settings.step_max_bytes * 10, _IMPORT_HARD_CAP_BYTES)
         zip_size = 0
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as tmp:
@@ -1648,7 +2067,12 @@ async def import_project_zip(
 
                 async with conn.transaction():
                     project = await projects_queries.create_project(
-                        conn, ws_id, name, "", default_visibility, tags,
+                        conn,
+                        ws_id,
+                        name,
+                        "",
+                        default_visibility,
+                        tags,
                         created_by=payload.get("sub"),
                     )
                     project_id = str(project["id"])
@@ -1676,22 +2100,32 @@ async def import_project_zip(
                             or entry_path.startswith("/")
                             or entry_path.startswith("\\")
                         ):
-                            skipped.append({"path": entry_path, "reason": "path traversal rejected"})
+                            skipped.append(
+                                {
+                                    "path": entry_path,
+                                    "reason": "path traversal rejected",
+                                }
+                            )
                             continue
 
                         # Symlink guard: reject symlink entries.
                         # ZIP external_attr upper 16 bits hold Unix mode; stat.S_ISLNK tests bit.
                         import stat as _stat
+
                         unix_mode = (entry.external_attr >> 16) & 0xFFFF
                         if unix_mode and _stat.S_ISLNK(unix_mode):
-                            skipped.append({"path": entry_path, "reason": "symlink rejected"})
+                            skipped.append(
+                                {"path": entry_path, "reason": "symlink rejected"}
+                            )
                             continue
 
                         # Use just the basename as the file name (flatten hierarchy
                         # to match file-by-file workaround behaviour).
                         file_name = os.path.basename(entry_path)
                         if not file_name:
-                            skipped.append({"path": entry_path, "reason": "empty filename"})
+                            skipped.append(
+                                {"path": entry_path, "reason": "empty filename"}
+                            )
                             continue
 
                         file_kind = _kind_from_ext(file_name)
@@ -1700,20 +2134,30 @@ async def import_project_zip(
                         try:
                             raw_bytes = zf.read(entry.filename)
                         except Exception as exc:
-                            skipped.append({"path": entry_path, "reason": f"read error: {exc}"})
+                            skipped.append(
+                                {"path": entry_path, "reason": f"read error: {exc}"}
+                            )
                             continue
 
                         # Binary kinds: store via storage backend; text kinds: store inline
                         binary_kinds = {
-                            "step", "step-ref", "mesh", "quadmesh", "subd",
-                            "render", "firmware", "gds_layout", "oasis_layout",
+                            "step",
+                            "step-ref",
+                            "mesh",
+                            "quadmesh",
+                            "subd",
+                            "render",
+                            "firmware",
+                            "gds_layout",
+                            "oasis_layout",
                         }
                         if file_kind in binary_kinds:
                             # Store blob via storage backend
                             storage = get_storage_required()
                             storage_key = f"projects/{project_id}/assets/{uuid.uuid4()}-{file_name}"
                             mime_guess = (
-                                "model/step" if file_kind == "step"
+                                "model/step"
+                                if file_kind == "step"
                                 else "application/octet-stream"
                             )
                             try:
@@ -1724,11 +2168,20 @@ async def import_project_zip(
                                     uncompressed_size,
                                 )
                             except Exception as exc:
-                                skipped.append({"path": entry_path, "reason": f"storage error: {exc}"})
+                                skipped.append(
+                                    {
+                                        "path": entry_path,
+                                        "reason": f"storage error: {exc}",
+                                    }
+                                )
                                 continue
                             await files_queries.create_file(
-                                conn, project_id, file_name, file_kind,
-                                None, "",
+                                conn,
+                                project_id,
+                                file_name,
+                                file_kind,
+                                None,
+                                "",
                                 storage_key=storage_key,
                                 mime_type=mime_guess,
                                 size=uncompressed_size,
@@ -1742,8 +2195,12 @@ async def import_project_zip(
                                 content = ""
                             ext = os.path.splitext(file_name.lower())[1]
                             await files_queries.create_file(
-                                conn, project_id, file_name, file_kind,
-                                None, content,
+                                conn,
+                                project_id,
+                                file_name,
+                                file_kind,
+                                None,
+                                content,
                                 extension=ext.lstrip(".") if ext else None,
                                 created_by=user_id,
                             )
@@ -1761,7 +2218,9 @@ async def import_project_zip(
 
 
 @router.get("/projects/{pid}")
-async def get_project(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def get_project(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
@@ -1771,12 +2230,16 @@ async def get_project(pid: str, request: Request, payload: dict = Depends(requir
             pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         ws_id = str(row["workspace_id"])
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         p = dict(row)
         p["my_role"] = role
@@ -1791,7 +2254,9 @@ class UpdateProjectRequest(BaseModel):
 
 
 @router.patch("/projects/{pid}")
-async def update_project(pid: str, req: UpdateProjectRequest, payload: dict = Depends(require_auth)):
+async def update_project(
+    pid: str, req: UpdateProjectRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
@@ -1801,15 +2266,22 @@ async def update_project(pid: str, req: UpdateProjectRequest, payload: dict = De
             pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         ws_id = str(row["workspace_id"])
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot edit project")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot edit project",
+            )
 
         if req.visibility and req.visibility not in ("private", "unlisted", "public"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid visibility")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid visibility"
+            )
 
         updates = {}
         if req.name is not None:
@@ -1831,7 +2303,9 @@ async def update_project(pid: str, req: UpdateProjectRequest, payload: dict = De
 
 
 @router.delete("/projects/{pid}")
-async def delete_project(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def delete_project(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
     logger = logging.getLogger(__name__)
 
@@ -1839,14 +2313,20 @@ async def delete_project(pid: str, request: Request, payload: dict = Depends(req
 
     # ── Phase 1: auth + collect storage keys BEFORE deleting rows ──────────
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT workspace_id FROM projects WHERE id = $1", pid)
+        row = await conn.fetchrow(
+            "SELECT workspace_id FROM projects WHERE id = $1", pid
+        )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         ws_id = str(row["workspace_id"])
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if role != "owner":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="owner only")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="owner only"
+            )
 
         # Collect every blob storage_key / mesh_storage_key from files rows.
         file_rows = await conn.fetch(
@@ -1863,7 +2343,7 @@ async def delete_project(pid: str, request: Request, payload: dict = Depends(req
             if r["kind"] == "part" and r["content"]:
                 try:
                     content_obj = json.loads(r["content"])
-                    for photo_key in (content_obj.get("photos") or []):
+                    for photo_key in content_obj.get("photos") or []:
                         if photo_key:
                             blob_keys.append(photo_key)
                 except Exception:
@@ -1935,11 +2415,15 @@ async def get_bom(pid: str, request: Request, payload: dict = Depends(require_au
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             "SELECT id, parent_id, name, kind, content FROM files "
@@ -2099,7 +2583,10 @@ async def get_bom(pid: str, request: Request, payload: dict = Depends(require_au
             non_stocked = False
             note = ""
             if ov:
-                if ov.get("quantity_override") is not None and ov["quantity_override"] >= 0:
+                if (
+                    ov.get("quantity_override") is not None
+                    and ov["quantity_override"] >= 0
+                ):
                     count = ov["quantity_override"]
                 non_stocked = bool(ov.get("non_stocked"))
                 note = ov.get("note") or ""
@@ -2153,7 +2640,9 @@ async def get_bom(pid: str, request: Request, payload: dict = Depends(require_au
                 warnings.append(f'Part "{doc.get("name", "")}" has no MPN')
             out.append(row)
 
-        out.sort(key=lambda r: (r["part"].get("name", ""), r.get("config_id", ""), r["path"]))
+        out.sort(
+            key=lambda r: (r["part"].get("name", ""), r.get("config_id", ""), r["path"])
+        )
 
         total_ptr = None
         if has_any_price:
@@ -2174,11 +2663,15 @@ async def list_files(pid: str, request: Request, payload: dict = Depends(require
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             """
@@ -2218,18 +2711,62 @@ class CreateFileRequest(BaseModel):
 # and the FileTree "+ New" menu KIND_ORDER. Module-level so tests can
 # import and assert the menu set is a subset.
 FILE_KINDS = (
-    "file", "text", "folder", "assembly", "step", "drawing", "sketch", "part",
-    "feature", "circuit", "equations", "material", "simulation", "script",
-    "step-ref", "assembly_lock", "canvas", "schedule", "view", "sheet",
-    "duct", "pipe", "conduit", "subd", "mesh", "render", "section",
-    "cam_layered", "tool", "plc_st", "plc_ld", "quadmesh", "print", "gem", "wiring",
-    "firmware", "mold", "pid", "optics", "layup", "dental",
+    "file",
+    "text",
+    "folder",
+    "assembly",
+    "step",
+    "drawing",
+    "sketch",
+    "part",
+    "feature",
+    "circuit",
+    "equations",
+    "material",
+    "simulation",
+    "script",
+    "step-ref",
+    "assembly_lock",
+    "canvas",
+    "schedule",
+    "view",
+    "sheet",
+    "duct",
+    "pipe",
+    "conduit",
+    "subd",
+    "mesh",
+    "render",
+    "section",
+    "cam_layered",
+    "tool",
+    "plc_st",
+    "plc_ld",
+    "quadmesh",
+    "print",
+    "gem",
+    "wiring",
+    "firmware",
+    "mold",
+    "pid",
+    "optics",
+    "layup",
+    "dental",
     # T-248: silicon / EDA / firmware file kinds
-    "hdl_vhdl", "hdl_verilog", "spice_netlist", "gds_layout", "oasis_layout",
-    "lef_lib", "def_design", "liberty_lib", "silicon_flow", "silicon_pdk",
+    "hdl_vhdl",
+    "hdl_verilog",
+    "spice_netlist",
+    "gds_layout",
+    "oasis_layout",
+    "lef_lib",
+    "def_design",
+    "liberty_lib",
+    "silicon_flow",
+    "silicon_pdk",
     "firmware_project",
     # T-330: PLM depth — ECO (Engineering Change Order) and SysML-light trace
-    "eco", "sysml",
+    "eco",
+    "sysml",
     # T-325: 1D system simulation — .system lumped-parameter network
     "system",
     # T-323: 3D in-vehicle wiring harness — .harness routed through the DMU
@@ -2238,29 +2775,49 @@ FILE_KINDS = (
 
 
 @router.post("/projects/{pid}/files")
-async def create_file(pid: str, req: CreateFileRequest, payload: dict = Depends(require_auth)):
+async def create_file(
+    pid: str, req: CreateFileRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot create files")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot create files",
+            )
 
         if not req.name:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name is required")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="name is required"
+            )
 
         if req.kind not in FILE_KINDS:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid kind")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid kind"
+            )
 
         content = req.content or ""
 
         f = await files_queries.create_file(
-            conn, pid, req.name, req.kind, req.parent_id, content, None, None, None, req.extension,
+            conn,
+            pid,
+            req.name,
+            req.kind,
+            req.parent_id,
+            content,
+            None,
+            None,
+            None,
+            req.extension,
             created_by=user_id,
         )
 
@@ -2271,18 +2828,24 @@ async def create_file(pid: str, req: CreateFileRequest, payload: dict = Depends(
 
 
 @router.get("/projects/{pid}/files/{fid}")
-async def get_file(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def get_file(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             """
@@ -2294,10 +2857,13 @@ async def get_file(pid: str, fid: str, request: Request, payload: dict = Depends
             LEFT JOIN step_tessellation_jobs j ON j.file_id = f.id
             WHERE f.id = $1 AND f.project_id = $2 AND f.deleted_at IS NULL
             """,
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         f = dict(row)
         if f.get("storage_key"):
@@ -2317,28 +2883,37 @@ _IDEMPOTENCY_WINDOW_SECS = 5
 
 
 @router.patch("/projects/{pid}/files/{fid}")
-async def update_file(pid: str, fid: str, req: UpdateFileRequest, payload: dict = Depends(require_auth)):
+async def update_file(
+    pid: str, fid: str, req: UpdateFileRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot edit files")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot edit files"
+            )
 
         # OCC: If content is being updated and expected_version was supplied,
         # check for a version mismatch before writing.
         if req.content is not None and req.expected_version is not None:
             current_row = await conn.fetchrow(
                 "SELECT version, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-                fid, pid,
+                fid,
+                pid,
             )
             if not current_row:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+                )
             if current_row["version"] != req.expected_version:
                 # Return conflict with enough info for the client to show a banner.
                 content_preview = (current_row["content"] or "")[:200]
@@ -2371,7 +2946,8 @@ async def update_file(pid: str, fid: str, req: UpdateFileRequest, payload: dict 
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                fid, idempotency_cutoff,
+                fid,
+                idempotency_cutoff,
             )
             if recent and recent["content_sha256"] is not None:
                 # content_sha256 may be stored as bytes/memoryview or hex text
@@ -2394,15 +2970,23 @@ async def update_file(pid: str, fid: str, req: UpdateFileRequest, payload: dict 
                 WHERE id = $1 AND deleted_at IS NULL
                 RETURNING *
                 """,
-                fid, req.content,
+                fid,
+                req.content,
             )
             if not f:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+                )
             f = dict(f)
             # Apply any other non-content field changes on top.
-            if req.name is not None or req.parent_id is not None or req.extension is not None:
+            if (
+                req.name is not None
+                or req.parent_id is not None
+                or req.extension is not None
+            ):
                 f2 = await files_queries.update_file(
-                    conn, fid,
+                    conn,
+                    fid,
                     name=req.name,
                     parent_id=req.parent_id,
                     extension=req.extension,
@@ -2411,7 +2995,8 @@ async def update_file(pid: str, fid: str, req: UpdateFileRequest, payload: dict 
                     f = dict(f2)
         else:
             f = await files_queries.update_file(
-                conn, fid,
+                conn,
+                fid,
                 name=req.name,
                 content=req.content,
                 parent_id=req.parent_id,
@@ -2419,7 +3004,9 @@ async def update_file(pid: str, fid: str, req: UpdateFileRequest, payload: dict 
             )
 
         if not f:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         f = dict(f)
         if f.get("storage_key"):
@@ -2428,75 +3015,102 @@ async def update_file(pid: str, fid: str, req: UpdateFileRequest, payload: dict 
 
 
 @router.delete("/projects/{pid}/files/{fid}")
-async def delete_file(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def delete_file(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot delete files")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot delete files",
+            )
 
         await files_queries.delete_file(conn, fid, soft=True)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/projects/{pid}/files/{fid}/download")
-async def download_file(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def download_file(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT storage_key, name, kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
-        if row['kind'] == 'step-ref':
-            ref = json.loads(row['content'])
+        if row["kind"] == "step-ref":
+            ref = json.loads(row["content"])
             blob_key = f"blobs/step/{ref['hash']}"
             storage = get_storage_required()
             blob_io, _ = await storage.get(blob_key)
             blob_bytes = blob_io.read()
-            original_name = ref.get('original_name', row['name'].replace('.step-ref', '.step'))
-            mime = ref.get('mime', 'model/step')
+            original_name = ref.get(
+                "original_name", row["name"].replace(".step-ref", ".step")
+            )
+            mime = ref.get("mime", "model/step")
             from fastapi.responses import Response as FastAPIResponse
+
             return FastAPIResponse(
                 content=blob_bytes,
                 media_type=mime,
-                headers={'Content-Disposition': f'attachment; filename="{original_name}"'},
+                headers={
+                    "Content-Disposition": f'attachment; filename="{original_name}"'
+                },
             )
 
         return {"url": f"/api/blobs/{row['storage_key']}"}
 
 
 @router.post("/projects/{pid}/files/{fid}/tessellate")
-async def tessellate(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def tessellate(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         await conn.execute(
             """
@@ -2509,25 +3123,34 @@ async def tessellate(pid: str, fid: str, request: Request, payload: dict = Depen
 
 
 @router.delete("/projects/{pid}/files/{fid}/tessellate")
-async def purge_tessellation(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def purge_tessellation(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT mesh_storage_key FROM files WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         await conn.execute(
             """
@@ -2540,18 +3163,24 @@ async def purge_tessellation(pid: str, fid: str, request: Request, payload: dict
 
 
 @router.post("/projects/{pid}/files/{fid}/fem")
-async def run_fem(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_fem(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot run FEM")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot run FEM"
+            )
 
         body = await read_json_body(request)
         input_spec = json.dumps(body) if body else "{}"
@@ -2563,24 +3192,32 @@ async def run_fem(pid: str, fid: str, request: Request, payload: dict = Depends(
                DO UPDATE SET input_spec = $3, status = 'queued', error = NULL,
                    started_at = NULL, finished_at = NULL
                RETURNING id""",
-            fid, pid, input_spec,
+            fid,
+            pid,
+            input_spec,
         )
         return {"job_id": str(row["id"]), "status": "queued"}
 
 
 @router.get("/projects/{pid}/files/{fid}/fem/status")
-async def fem_job_status(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def fem_job_status(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT id, status, result_json, error FROM fem_jobs WHERE file_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -2599,7 +3236,9 @@ async def fem_job_status(pid: str, fid: str, request: Request, payload: dict = D
 
 
 @router.post("/projects/{pid}/files/{fid}/solve-mates")
-async def solve_mates(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def solve_mates(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """Solve assembly geometric constraints and return component transforms."""
     user_id = payload.get("sub")
 
@@ -2607,20 +3246,30 @@ async def solve_mates(pid: str, fid: str, request: Request, payload: dict = Depe
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
         if row["kind"] != "assembly":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file is not an assembly")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="file is not an assembly",
+            )
 
         body = await read_json_body(request)
         fixed_component_id = body.get("fixed_component_id") if body else None
@@ -2637,10 +3286,15 @@ async def solve_mates(pid: str, fid: str, request: Request, payload: dict = Depe
         pyworker_url = os.environ.get("PYWORKER_URL", "http://localhost:9090")
         try:
             import httpx as _httpx
+
             async with _httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
                     f"{pyworker_url}/run-mates",
-                    json={"components": components, "mates": mates, "fixed_component_id": fixed_component_id},
+                    json={
+                        "components": components,
+                        "mates": mates,
+                        "fixed_component_id": fixed_component_id,
+                    },
                 )
             if resp.status_code == 200:
                 return resp.json()
@@ -2649,12 +3303,17 @@ async def solve_mates(pid: str, fid: str, request: Request, payload: dict = Depe
 
         # In-process fallback
         from kerf_mates.solver import solve_assembly
-        result = solve_assembly(components, mates, fixed_component_id=fixed_component_id)
+
+        result = solve_assembly(
+            components, mates, fixed_component_id=fixed_component_id
+        )
         return result
 
 
 @router.post("/projects/{pid}/files/{fid}/tolerance/run")
-async def run_tolerance(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_tolerance(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """Run tolerance stack-up (worst_case, rss, or monte_carlo) for a .tolerance file."""
     user_id = payload.get("sub")
 
@@ -2662,20 +3321,30 @@ async def run_tolerance(pid: str, fid: str, request: Request, payload: dict = De
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
         if row["kind"] != "tolerance":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file is not a .tolerance file")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="file is not a .tolerance file",
+            )
 
         body = await read_json_body(request)
         method = body.get("method", "monte_carlo") if body else "monte_carlo"
@@ -2689,9 +3358,13 @@ async def run_tolerance(pid: str, fid: str, request: Request, payload: dict = De
 
         dimensions = doc.get("tolerances", [])
         if not dimensions:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="no tolerances defined in file")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="no tolerances defined in file",
+            )
 
-        from kerf_mates.tolerance import worst_case, rss, monte_carlo
+        from kerf_mates.tolerance import monte_carlo, rss, worst_case
+
         if method == "worst_case":
             return worst_case(dimensions)
         elif method == "rss":
@@ -2701,18 +3374,24 @@ async def run_tolerance(pid: str, fid: str, request: Request, payload: dict = De
 
 
 @router.post("/projects/{pid}/files/{fid}/cam")
-async def run_cam(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_cam(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot run CAM")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot run CAM"
+            )
 
         body = await read_json_body(request)
         input_spec = json.dumps(body) if body else "{}"
@@ -2724,24 +3403,32 @@ async def run_cam(pid: str, fid: str, request: Request, payload: dict = Depends(
                DO UPDATE SET input_spec = $3, status = 'queued', error = NULL,
                    started_at = NULL, finished_at = NULL
                RETURNING id""",
-            fid, pid, input_spec,
+            fid,
+            pid,
+            input_spec,
         )
         return {"job_id": str(row["id"]), "status": "queued"}
 
 
 @router.get("/projects/{pid}/files/{fid}/cam/status")
-async def cam_job_status(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def cam_job_status(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT id, status, result_json, output_key, error FROM cam_jobs WHERE file_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -2761,18 +3448,25 @@ async def cam_job_status(pid: str, fid: str, request: Request, payload: dict = D
 
 
 @router.post("/projects/{pid}/files/{fid}/sim")
-async def run_sim(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_sim(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot run simulation")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot run simulation",
+            )
 
         body = await read_json_body(request)
         analysis = body.get("analysis", {})
@@ -2783,24 +3477,32 @@ async def run_sim(pid: str, fid: str, request: Request, payload: dict = Depends(
 
         row = await conn.fetchrow(
             "INSERT INTO sim_jobs (file_id, project_id, input_spec) VALUES ($1, $2, $3) RETURNING id",
-            fid, pid, json.dumps(input_spec),
+            fid,
+            pid,
+            json.dumps(input_spec),
         )
         return {"job_id": str(row["id"])}
 
 
 @router.get("/projects/{pid}/files/{fid}/sim/status")
-async def sim_job_status(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def sim_job_status(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT id, status, result_json, error FROM sim_jobs WHERE file_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -2847,27 +3549,38 @@ async def lookup_derived_artifact(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         try:
             body = await read_json_body(request)
         except Exception:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body"
+            )
 
         derived_kind = body.get("derived_kind", "")
         if derived_kind not in DERIVED_KIND_ALLOWED:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid derived_kind")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid derived_kind"
+            )
 
         content_row = await conn.fetchrow(
             "SELECT COALESCE(content, '') FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not content_row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         content = content_row[0]
         content_hash = compute_content_sha(content)
@@ -2881,7 +3594,9 @@ async def lookup_derived_artifact(
             WHERE source_file_id = $1 AND content_sha256 = $2 AND derived_kind = $3
             RETURNING payload, last_accessed_at
             """,
-            fid, content_hash, derived_kind,
+            fid,
+            content_hash,
+            derived_kind,
         )
 
         if not row:
@@ -2919,36 +3634,52 @@ async def store_derived_artifact(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         try:
             body = await read_json_body(request)
         except Exception:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body"
+            )
 
         derived_kind = body.get("derived_kind", "")
         if derived_kind not in DERIVED_KIND_ALLOWED:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid derived_kind")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid derived_kind"
+            )
 
         payload_b64 = body.get("payload_b64", "")
         try:
             payload_bytes = base64.b64decode(payload_b64)
         except Exception:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid payload_b64")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid payload_b64"
+            )
 
         if len(payload_bytes) > DERIVED_MAX_PAYLOAD_BYTES:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="payload exceeds 16MiB cap")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="payload exceeds 16MiB cap",
+            )
 
         content_row = await conn.fetchrow(
             "SELECT COALESCE(content, '') FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not content_row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         content = content_row[0]
         content_hash = compute_content_sha(content)
@@ -2962,7 +3693,11 @@ async def store_derived_artifact(
                 payload_size_bytes = excluded.payload_size_bytes,
                 last_accessed_at = now()
             """,
-            fid, content_hash, derived_kind, payload_bytes, len(payload_bytes),
+            fid,
+            content_hash,
+            derived_kind,
+            payload_bytes,
+            len(payload_bytes),
         )
 
         return {
@@ -2985,18 +3720,25 @@ async def purge_derived_artifacts(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         exists_row = await conn.fetchrow(
             "SELECT true FROM files WHERE id = $1 AND project_id = $2",
-            fid, pid,
+            fid,
+            pid,
         )
         if not exists_row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         result = await conn.execute(
             "DELETE FROM derived_artifacts WHERE source_file_id = $1",
@@ -3029,18 +3771,25 @@ async def get_file_diff(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         file_row = await conn.fetchrow(
             "SELECT id, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not file_row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         current_content = file_row["content"] or ""
 
@@ -3056,10 +3805,15 @@ async def get_file_diff(
                     JOIN files f ON f.id = fr.file_id
                     WHERE fr.id = $1 AND fr.file_id = $2 AND f.project_id = $3
                     """,
-                    against, fid, pid,
+                    against,
+                    fid,
+                    pid,
                 )
                 if not rev_row:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="revision not found")
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="revision not found",
+                    )
                 against_revision_id = str(rev_row["id"])
                 against_content = rev_row["content"] or ""
             else:
@@ -3161,18 +3915,24 @@ async def get_file_diff(
 
 
 @router.post("/projects/{pid}/assets")
-async def upload_asset(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def upload_asset(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload"
+            )
 
         return {"status": "ok"}
 
@@ -3209,11 +3969,15 @@ async def get_project_activity(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         # Build optional before-cursor clause. Parameterised to avoid injection.
         # We add a position placeholder $3 for `before` when supplied.
@@ -3358,7 +4122,9 @@ async def get_project_activity(
     for row in page:
         ev = {
             "kind": row["kind"],
-            "created_at": row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+            "created_at": row["created_at"].isoformat()
+            if hasattr(row["created_at"], "isoformat")
+            else str(row["created_at"]),
             "user": {
                 "id": str(row["user_id"]) if row["user_id"] else None,
                 "name": row["user_name"] or "",
@@ -3385,18 +4151,24 @@ async def get_project_activity(
 
 
 @router.get("/projects/{pid}/threads")
-async def list_threads(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def list_threads(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             "SELECT * FROM chat_threads WHERE project_id = $1 ORDER BY last_message_at DESC",
@@ -3412,18 +4184,24 @@ class CreateThreadRequest(BaseModel):
 
 
 @router.post("/projects/{pid}/threads")
-async def create_thread(pid: str, req: CreateThreadRequest, payload: dict = Depends(require_auth)):
+async def create_thread(
+    pid: str, req: CreateThreadRequest, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             """
@@ -3431,59 +4209,81 @@ async def create_thread(pid: str, req: CreateThreadRequest, payload: dict = Depe
             VALUES ($1, $2, $3, $4, $5)
             RETURNING *
             """,
-            pid, req.file_id, req.title, req.model, user_id,
+            pid,
+            req.file_id,
+            req.title,
+            req.model,
+            user_id,
         )
         return dict(row)
 
 
 @router.patch("/projects/{pid}/threads/{tid}")
-async def update_thread(pid: str, tid: str, request: Request, payload: dict = Depends(require_auth)):
+async def update_thread(
+    pid: str, tid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         return {"status": "ok"}
 
 
 @router.delete("/projects/{pid}/threads/{tid}")
-async def delete_thread(pid: str, tid: str, request: Request, payload: dict = Depends(require_auth)):
+async def delete_thread(
+    pid: str, tid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         await conn.execute("DELETE FROM chat_threads WHERE id = $1", tid)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/projects/{pid}/threads/{tid}/messages")
-async def list_messages(pid: str, tid: str, request: Request, payload: dict = Depends(require_auth)):
+async def list_messages(
+    pid: str, tid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             "SELECT * FROM chat_messages WHERE thread_id = $1 ORDER BY created_at ASC",
@@ -3518,43 +4318,57 @@ class PostMessageRequest(BaseModel):
     model: Optional[str] = None
 
 
-async def _insert_assistant_message(conn, tid: str, content: str, model_id: str, tool_calls: list) -> dict:
-    tc_json = json.dumps([
-        {
-            "id": tc.id,
-            "name": tc.name,
-            "arguments": tc.arguments_json,
-            # Persist provider_metadata so opaque round-trip tokens
-            # (Gemini 3 thought_signature, etc.) survive across turns.
-            # Empty dict serialises to "{}" — cheap.
-            "provider_metadata": getattr(tc, "provider_metadata", None) or {},
-        }
-        for tc in (tool_calls or [])
-    ])
+async def _insert_assistant_message(
+    conn, tid: str, content: str, model_id: str, tool_calls: list
+) -> dict:
+    tc_json = json.dumps(
+        [
+            {
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments_json,
+                # Persist provider_metadata so opaque round-trip tokens
+                # (Gemini 3 thought_signature, etc.) survive across turns.
+                # Empty dict serialises to "{}" — cheap.
+                "provider_metadata": getattr(tc, "provider_metadata", None) or {},
+            }
+            for tc in (tool_calls or [])
+        ]
+    )
     row = await conn.fetchrow(
         """
         INSERT INTO chat_messages (thread_id, role, content, part_refs, tool_calls, model)
         VALUES ($1, 'assistant', $2, '[]'::jsonb, $3::jsonb, $4)
         RETURNING *
         """,
-        tid, content, tc_json, model_id,
+        tid,
+        content,
+        tc_json,
+        model_id,
     )
     return dict(row)
 
 
-async def _insert_tool_message(conn, tid: str, tool_call_id: str, content: str, is_error: bool = False) -> dict:
+async def _insert_tool_message(
+    conn, tid: str, tool_call_id: str, content: str, is_error: bool = False
+) -> dict:
     row = await conn.fetchrow(
         """
         INSERT INTO chat_messages (thread_id, role, content, part_refs, tool_call_id, is_error)
         VALUES ($1, 'tool', $2, '[]'::jsonb, $3, $4)
         RETURNING *
         """,
-        tid, content, tool_call_id, is_error,
+        tid,
+        content,
+        tool_call_id,
+        is_error,
     )
     return dict(row)
 
 
-_CHAT_HISTORY_LIMIT = int(__import__("os").environ.get("KERF_CHAT_HISTORY_LIMIT", "200"))
+_CHAT_HISTORY_LIMIT = int(
+    __import__("os").environ.get("KERF_CHAT_HISTORY_LIMIT", "200")
+)
 
 
 async def _load_llm_history(conn, thread_id: str, exclude_id: str) -> list:
@@ -3572,7 +4386,9 @@ async def _load_llm_history(conn, thread_id: str, exclude_id: str) -> list:
         ) sub
         ORDER BY created_at ASC
         """,
-        thread_id, exclude_id, _CHAT_HISTORY_LIMIT,
+        thread_id,
+        exclude_id,
+        _CHAT_HISTORY_LIMIT,
     )
     out = []
     for row in rows:
@@ -3589,12 +4405,14 @@ async def _load_llm_history(conn, thread_id: str, exclude_id: str) -> list:
             try:
                 arr = json.loads(tc_raw) if isinstance(tc_raw, (str, bytes)) else tc_raw
                 for w in arr:
-                    msg.tool_calls.append(llm_module.ToolCall(
-                        id=w.get("id", ""),
-                        name=w.get("name", ""),
-                        arguments_json=w.get("arguments", "{}"),
-                        provider_metadata=w.get("provider_metadata") or {},
-                    ))
+                    msg.tool_calls.append(
+                        llm_module.ToolCall(
+                            id=w.get("id", ""),
+                            name=w.get("name", ""),
+                            arguments_json=w.get("arguments", "{}"),
+                            provider_metadata=w.get("provider_metadata") or {},
+                        )
+                    )
             except Exception:
                 pass
         out.append(msg)
@@ -3606,20 +4424,31 @@ async def _load_part_contexts(conn, project_id: str, refs: list) -> list:
         return []
     out = []
     for ref in refs:
-        file_id = ref.get("file_id") if isinstance(ref, dict) else getattr(ref, "file_id", None)
-        part_id = ref.get("part_id") if isinstance(ref, dict) else getattr(ref, "part_id", None)
+        file_id = (
+            ref.get("file_id")
+            if isinstance(ref, dict)
+            else getattr(ref, "file_id", None)
+        )
+        part_id = (
+            ref.get("part_id")
+            if isinstance(ref, dict)
+            else getattr(ref, "part_id", None)
+        )
         if not file_id:
             continue
         row = await conn.fetchrow(
             "SELECT name, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            file_id, project_id,
+            file_id,
+            project_id,
         )
         if row:
-            out.append(llm_module.PartContext(
-                file_path=row["name"],
-                part_id=part_id or "",
-                content=row["content"] or "",
-            ))
+            out.append(
+                llm_module.PartContext(
+                    file_path=row["name"],
+                    part_id=part_id or "",
+                    content=row["content"] or "",
+                )
+            )
     return out
 
 
@@ -3642,12 +4471,14 @@ async def _auto_title_thread(
     try:
         resp = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: provider.complete(llm_module.CompleteRequest(
-                model=model_id,
-                system="You name CAD chat threads succinctly. Output only the title.",
-                messages=[llm_module.Message(role="user", content=prompt)],
-                max_tokens=32,
-            ))
+            lambda: provider.complete(
+                llm_module.CompleteRequest(
+                    model=model_id,
+                    system="You name CAD chat threads succinctly. Output only the title.",
+                    messages=[llm_module.Message(role="user", content=prompt)],
+                    max_tokens=32,
+                )
+            ),
         )
         title = resp.content.strip().strip("\"'`").rstrip(".!?")
         if len(title) > 80:
@@ -3657,7 +4488,8 @@ async def _auto_title_thread(
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE chat_threads SET title = $1, updated_at = now() WHERE id = $2",
-                title, tid,
+                title,
+                tid,
             )
             # R22: emit operator-cost row so auto-title COGS are auditable.
             if settings.usage_enabled and user_id:
@@ -3668,8 +4500,12 @@ async def _auto_title_thread(
                         kind="operator_token",
                         project_id=uuid.UUID(project_id) if project_id else None,
                         model=model_id,
-                        input_tokens=resp.input_tokens if hasattr(resp, "input_tokens") else 0,
-                        output_tokens=resp.output_tokens if hasattr(resp, "output_tokens") else 0,
+                        input_tokens=resp.input_tokens
+                        if hasattr(resp, "input_tokens")
+                        else 0,
+                        output_tokens=resp.output_tokens
+                        if hasattr(resp, "output_tokens")
+                        else 0,
                         payer="operator",
                     )
                 except Exception as _ue:
@@ -3684,7 +4520,9 @@ async def post_message(
     tid: str,
     req: PostMessageRequest,
     payload: dict = Depends(require_auth),
-    _rl: None = Depends(rate_limit(max_per_window=30, window_seconds=60, key_prefix="api:messages")),
+    _rl: None = Depends(
+        rate_limit(max_per_window=30, window_seconds=60, key_prefix="api:messages")
+    ),
 ):
     user_id = payload.get("sub")
 
@@ -3692,14 +4530,20 @@ async def post_message(
 
     ws_id = await project_workspace_id(pid)
     if not ws_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        )
 
     async with pool.acquire() as conn:
         role = await get_user_workspace_role(conn, ws_id, user_id)
     if not role:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        )
     if role == "viewer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot post messages")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot post messages"
+        )
 
     # Validate thread belongs to project
     async with pool.acquire() as conn:
@@ -3707,23 +4551,30 @@ async def post_message(
             "SELECT id FROM chat_threads WHERE id = $1 AND project_id = $2", tid, pid
         )
     if not thread_row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="thread not found"
+        )
 
     if not req.content:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="content is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="content is required"
+        )
 
     part_refs = req.part_refs or []
 
     # Count existing user messages for auto-title trigger
     async with pool.acquire() as conn:
         existing_user_count = await conn.fetchval(
-            "SELECT count(*) FROM chat_messages WHERE thread_id = $1 AND role = 'user'", tid
+            "SELECT count(*) FROM chat_messages WHERE thread_id = $1 AND role = 'user'",
+            tid,
         )
-    is_first_user_message = (existing_user_count == 0)
+    is_first_user_message = existing_user_count == 0
 
     # Resolve model: body.model -> thread.model -> default
     async with pool.acquire() as conn:
-        thread_model_row = await conn.fetchrow("SELECT model FROM chat_threads WHERE id = $1", tid)
+        thread_model_row = await conn.fetchrow(
+            "SELECT model FROM chat_threads WHERE id = $1", tid
+        )
     thread_model = thread_model_row["model"] if thread_model_row else None
     if req.model:
         chosen_model = req.model
@@ -3741,7 +4592,10 @@ async def post_message(
             VALUES ($1, 'user', $2, $3::jsonb, $4)
             RETURNING *
             """,
-            tid, req.content, json.dumps(part_refs), user_id,
+            tid,
+            req.content,
+            json.dumps(part_refs),
+            user_id,
         )
     user_msg = dict(user_row)
 
@@ -3761,9 +4615,14 @@ async def post_message(
                 conn, tid, "LLM not configured — set ANTHROPIC_API_KEY", "none", None
             )
             await conn.execute(
-                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                tid,
             )
-        return {"user_message": user_msg, "assistant_message": assistant_msg, "tool_messages": []}
+        return {
+            "user_message": user_msg,
+            "assistant_message": assistant_msg,
+            "tool_messages": [],
+        }
 
     try:
         provider, provider_model_id = registry.resolve(chosen_model)
@@ -3771,14 +4630,21 @@ async def post_message(
         _logger.warning(f"llm: resolve {chosen_model!r} failed: {e}")
         async with pool.acquire() as conn:
             assistant_msg = await _insert_assistant_message(
-                conn, tid,
+                conn,
+                tid,
                 "That model isn't available right now. Try picking a different one from the model dropdown.",
-                "none", None,
+                "none",
+                None,
             )
             await conn.execute(
-                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                tid,
             )
-        return {"user_message": user_msg, "assistant_message": assistant_msg, "tool_messages": []}
+        return {
+            "user_message": user_msg,
+            "assistant_message": assistant_msg,
+            "tool_messages": [],
+        }
 
     # Kerf is 100% free, self-hosted software — there is no credit/quota gate.
     # If the caller saved their own provider key (POST /api/provider-keys),
@@ -3813,12 +4679,16 @@ async def post_message(
         try:
             resp = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: provider.complete(llm_module.CompleteRequest(
-                    model=provider_model_id,
-                    system=llm_module.SystemPrompt + _AGENT_SYSTEM_ADDENDUM + type_addendum,
-                    messages=history_msgs,
-                    tools=tool_specs,
-                ))
+                lambda: provider.complete(
+                    llm_module.CompleteRequest(
+                        model=provider_model_id,
+                        system=llm_module.SystemPrompt
+                        + _AGENT_SYSTEM_ADDENDUM
+                        + type_addendum,
+                        messages=history_msgs,
+                        tools=tool_specs,
+                    )
+                ),
             )
         except Exception as e:
             _logger.error(
@@ -3827,12 +4697,21 @@ async def post_message(
             )
             async with pool.acquire() as conn:
                 last_assistant = await _insert_assistant_message(
-                    conn, tid, _friendly_llm_error(provider.name(), e), provider_model_id, None
+                    conn,
+                    tid,
+                    _friendly_llm_error(provider.name(), e),
+                    provider_model_id,
+                    None,
                 )
                 await conn.execute(
-                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                    tid,
                 )
-            return {"user_message": user_msg, "assistant_message": last_assistant, "tool_messages": tool_msgs}
+            return {
+                "user_message": user_msg,
+                "assistant_message": last_assistant,
+                "tool_messages": tool_msgs,
+            }
 
         # Persist assistant turn
         async with pool.acquire() as conn:
@@ -3860,11 +4739,13 @@ async def post_message(
                 _logger.warning(f"usage: record token event: {ue}")
 
         # Append assistant turn to history
-        history_msgs.append(llm_module.Message(
-            role="assistant",
-            content=resp.content,
-            tool_calls=resp.tool_calls,
-        ))
+        history_msgs.append(
+            llm_module.Message(
+                role="assistant",
+                content=resp.content,
+                tool_calls=resp.tool_calls,
+            )
+        )
 
         if not resp.tool_calls or resp.stop_reason == "stop":
             break
@@ -3873,12 +4754,18 @@ async def post_message(
         for tc in resp.tool_calls:
             tool_is_error = False
             try:
-                result = await tools_execute(proj_ctx, tc.name, tc.arguments_json.encode())
+                result = await tools_execute(
+                    proj_ctx, tc.name, tc.arguments_json.encode()
+                )
                 # Detect error payloads returned by the executor
                 # (err_payload returns {"error": ..., "code": ...}).
                 try:
                     _parsed = json.loads(result)
-                    if isinstance(_parsed, dict) and "error" in _parsed and "code" in _parsed:
+                    if (
+                        isinstance(_parsed, dict)
+                        and "error" in _parsed
+                        and "code" in _parsed
+                    ):
                         tool_is_error = True
                 except Exception:
                     pass
@@ -3886,35 +4773,52 @@ async def post_message(
                 result = json.dumps({"error": str(tool_exc), "code": "ERROR"})
                 tool_is_error = True
             async with pool.acquire() as conn:
-                tm = await _insert_tool_message(conn, tid, tc.id, result, is_error=tool_is_error)
+                tm = await _insert_tool_message(
+                    conn, tid, tc.id, result, is_error=tool_is_error
+                )
             tm["tool_name"] = tc.name
             tool_msgs.append(tm)
-            history_msgs.append(llm_module.Message(
-                role="tool",
-                content=result,
-                tool_call_id=tc.id,
-                is_error=tool_is_error,
-            ))
+            history_msgs.append(
+                llm_module.Message(
+                    role="tool",
+                    content=result,
+                    tool_call_id=tc.id,
+                    is_error=tool_is_error,
+                )
+            )
 
         if iteration == _MAX_AGENT_ITERATIONS - 1:
             async with pool.acquire() as conn:
                 last_assistant = await _insert_assistant_message(
-                    conn, tid, "(stopped: max tool iterations reached)", provider_model_id, None
+                    conn,
+                    tid,
+                    "(stopped: max tool iterations reached)",
+                    provider_model_id,
+                    None,
                 )
             break
 
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+            "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+            tid,
         )
 
     # Auto-title on first exchange (fire and forget)
     if is_first_user_message and registry.has_any():
         assistant_content = last_assistant.get("content", "") if last_assistant else ""
-        asyncio.create_task(_auto_title_thread(
-            tid, req.content, assistant_content, provider, provider_model_id, pool,
-            user_id=user_id, project_id=pid,
-        ))
+        asyncio.create_task(
+            _auto_title_thread(
+                tid,
+                req.content,
+                assistant_content,
+                provider,
+                provider_model_id,
+                pool,
+                user_id=user_id,
+                project_id=pid,
+            )
+        )
 
     return {
         "user_message": user_msg,
@@ -3927,6 +4831,7 @@ async def post_message(
 # Streaming chat endpoint — SSE
 # ---------------------------------------------------------------------------
 
+
 def _sse_frame(event_name: str, data: dict) -> str:
     """Format a single SSE frame."""
     return f"event: {event_name}\ndata: {json.dumps(data)}\n\n"
@@ -3938,7 +4843,11 @@ async def post_message_stream(
     tid: str,
     req: PostMessageRequest,
     payload: dict = Depends(require_auth),
-    _rl: None = Depends(rate_limit(max_per_window=30, window_seconds=60, key_prefix="api:messages_stream")),
+    _rl: None = Depends(
+        rate_limit(
+            max_per_window=30, window_seconds=60, key_prefix="api:messages_stream"
+        )
+    ),
 ):
     """Streaming (SSE) variant of POST /messages.
 
@@ -3955,37 +4864,50 @@ async def post_message_stream(
     # ── Auth / project access ────────────────────────────────────────────────
     ws_id = await project_workspace_id(pid)
     if not ws_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        )
 
     async with pool.acquire() as conn:
         role = await get_user_workspace_role(conn, ws_id, user_id)
     if not role:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+        )
     if role == "viewer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot post messages")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot post messages"
+        )
 
     async with pool.acquire() as conn:
         thread_row = await conn.fetchrow(
             "SELECT id FROM chat_threads WHERE id = $1 AND project_id = $2", tid, pid
         )
     if not thread_row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="thread not found"
+        )
 
     if not req.content:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="content is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="content is required"
+        )
 
     part_refs = req.part_refs or []
 
     # Count existing user messages for auto-title trigger
     async with pool.acquire() as conn:
         existing_user_count = await conn.fetchval(
-            "SELECT count(*) FROM chat_messages WHERE thread_id = $1 AND role = 'user'", tid
+            "SELECT count(*) FROM chat_messages WHERE thread_id = $1 AND role = 'user'",
+            tid,
         )
-    is_first_user_message = (existing_user_count == 0)
+    is_first_user_message = existing_user_count == 0
 
     # Resolve model: body.model -> thread.model -> default
     async with pool.acquire() as conn:
-        thread_model_row = await conn.fetchrow("SELECT model FROM chat_threads WHERE id = $1", tid)
+        thread_model_row = await conn.fetchrow(
+            "SELECT model FROM chat_threads WHERE id = $1", tid
+        )
     thread_model = thread_model_row["model"] if thread_model_row else None
     if req.model:
         chosen_model = req.model
@@ -4002,7 +4924,10 @@ async def post_message_stream(
             VALUES ($1, 'user', $2, $3::jsonb, $4)
             RETURNING *
             """,
-            tid, req.content, json.dumps(part_refs), user_id,
+            tid,
+            req.content,
+            json.dumps(part_refs),
+            user_id,
         )
     user_msg = dict(user_row)
 
@@ -4043,13 +4968,24 @@ async def post_message_stream(
         yield _sse_frame("user_message", {"id": str(user_msg["id"])})
 
         if not registry.has_any():
-            yield _sse_frame("error", {"message": "LLM not configured — set ANTHROPIC_API_KEY", "is_error": True})
+            yield _sse_frame(
+                "error",
+                {
+                    "message": "LLM not configured — set ANTHROPIC_API_KEY",
+                    "is_error": True,
+                },
+            )
             async with pool.acquire() as conn:
                 await _insert_assistant_message(
-                    conn, tid, "LLM not configured — set ANTHROPIC_API_KEY", "none", None
+                    conn,
+                    tid,
+                    "LLM not configured — set ANTHROPIC_API_KEY",
+                    "none",
+                    None,
                 )
                 await conn.execute(
-                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                    tid,
                 )
             return
 
@@ -4062,7 +4998,8 @@ async def post_message_stream(
             async with pool.acquire() as conn:
                 await _insert_assistant_message(conn, tid, msg, "none", None)
                 await conn.execute(
-                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                    tid,
                 )
             return
 
@@ -4079,7 +5016,9 @@ async def post_message_stream(
             for iteration in range(_MAX_AGENT_ITERATIONS):
                 complete_req = llm_module.CompleteRequest(
                     model=provider_model_id,
-                    system=llm_module.SystemPrompt + _AGENT_SYSTEM_ADDENDUM + type_addendum,
+                    system=llm_module.SystemPrompt
+                    + _AGENT_SYSTEM_ADDENDUM
+                    + type_addendum,
                     messages=history_msgs,
                     tools=tool_specs,
                 )
@@ -4125,7 +5064,9 @@ async def post_message_stream(
                             tid_key = ev.data["tool_use_id"]
                             assembled_input = ev.data.get("input", {})
                             if tid_key in pending_tools:
-                                pending_tools[tid_key].arguments_json = json.dumps(assembled_input)
+                                pending_tools[tid_key].arguments_json = json.dumps(
+                                    assembled_input
+                                )
                                 # Carry provider_metadata (e.g. Gemini 3's
                                 # thought_signature) into the ToolCall so
                                 # it gets persisted + echoed on the next
@@ -4151,11 +5092,16 @@ async def post_message_stream(
                         )
                     except Exception as e:
                         err_msg = _friendly_llm_error(provider.name(), e)
-                        yield _sse_frame("error", {"message": err_msg, "is_error": True})
+                        yield _sse_frame(
+                            "error", {"message": err_msg, "is_error": True}
+                        )
                         async with pool.acquire() as conn:
-                            await _insert_assistant_message(conn, tid, err_msg, provider_model_id, None)
+                            await _insert_assistant_message(
+                                conn, tid, err_msg, provider_model_id, None
+                            )
                             await conn.execute(
-                                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                                tid,
                             )
                         return
                     turn_text_parts = [resp.content]
@@ -4169,12 +5115,17 @@ async def post_message_stream(
 
                 except Exception as e:
                     err_msg = _friendly_llm_error(provider.name(), e)
-                    _logger.error(f"llm stream: provider {provider.name()} model {provider_model_id} failed: {e}")
+                    _logger.error(
+                        f"llm stream: provider {provider.name()} model {provider_model_id} failed: {e}"
+                    )
                     yield _sse_frame("error", {"message": err_msg, "is_error": True})
                     async with pool.acquire() as conn:
-                        await _insert_assistant_message(conn, tid, err_msg, provider_model_id, None)
+                        await _insert_assistant_message(
+                            conn, tid, err_msg, provider_model_id, None
+                        )
                         await conn.execute(
-                            "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                            "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                            tid,
                         )
                     return
 
@@ -4208,32 +5159,45 @@ async def post_message_stream(
                         _logger.warning(f"usage stream: record token event: {ue}")
 
                 # Append assistant turn to history
-                history_msgs.append(llm_module.Message(
-                    role="assistant",
-                    content=assistant_content,
-                    tool_calls=turn_tool_calls,
-                ))
+                history_msgs.append(
+                    llm_module.Message(
+                        role="assistant",
+                        content=assistant_content,
+                        tool_calls=turn_tool_calls,
+                    )
+                )
 
                 if not turn_tool_calls or stop_reason == "stop":
                     # Final turn — emit assistant_done and break.
-                    yield _sse_frame("assistant_done", {
-                        "stop_reason": stop_reason,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "model": provider_model_id,
-                    })
+                    yield _sse_frame(
+                        "assistant_done",
+                        {
+                            "stop_reason": stop_reason,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "model": provider_model_id,
+                        },
+                    )
                     break
 
                 # ── Execute tool calls ────────────────────────────────────────
                 for tc in turn_tool_calls:
-                    yield _sse_frame("tool_executing", {"tool_use_id": tc.id, "name": tc.name})
+                    yield _sse_frame(
+                        "tool_executing", {"tool_use_id": tc.id, "name": tc.name}
+                    )
 
                     tool_is_error = False
                     try:
-                        result = await tools_execute(proj_ctx, tc.name, tc.arguments_json.encode())
+                        result = await tools_execute(
+                            proj_ctx, tc.name, tc.arguments_json.encode()
+                        )
                         try:
                             _parsed = json.loads(result)
-                            if isinstance(_parsed, dict) and "error" in _parsed and "code" in _parsed:
+                            if (
+                                isinstance(_parsed, dict)
+                                and "error" in _parsed
+                                and "code" in _parsed
+                            ):
                                 tool_is_error = True
                         except Exception:
                             pass
@@ -4242,29 +5206,39 @@ async def post_message_stream(
                         tool_is_error = True
 
                     async with pool.acquire() as conn:
-                        tm = await _insert_tool_message(conn, tid, tc.id, result, is_error=tool_is_error)
+                        tm = await _insert_tool_message(
+                            conn, tid, tc.id, result, is_error=tool_is_error
+                        )
 
                     content_preview = result[:200] if result else ""
-                    yield _sse_frame("tool_result", {
-                        "tool_use_id": tc.id,
-                        "is_error": tool_is_error,
-                        "content_preview": content_preview,
-                    })
+                    yield _sse_frame(
+                        "tool_result",
+                        {
+                            "tool_use_id": tc.id,
+                            "is_error": tool_is_error,
+                            "content_preview": content_preview,
+                        },
+                    )
 
-                    history_msgs.append(llm_module.Message(
-                        role="tool",
-                        content=result,
-                        tool_call_id=tc.id,
-                        is_error=tool_is_error,
-                    ))
+                    history_msgs.append(
+                        llm_module.Message(
+                            role="tool",
+                            content=result,
+                            tool_call_id=tc.id,
+                            is_error=tool_is_error,
+                        )
+                    )
 
                 if stop_reason != "tool_use" and not turn_tool_calls:
-                    yield _sse_frame("assistant_done", {
-                        "stop_reason": stop_reason,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "model": provider_model_id,
-                    })
+                    yield _sse_frame(
+                        "assistant_done",
+                        {
+                            "stop_reason": stop_reason,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "model": provider_model_id,
+                        },
+                    )
                     break
 
                 if iteration == _MAX_AGENT_ITERATIONS - 1:
@@ -4273,12 +5247,15 @@ async def post_message_stream(
                         last_assistant_db = await _insert_assistant_message(
                             conn, tid, msg, provider_model_id, None
                         )
-                    yield _sse_frame("assistant_done", {
-                        "stop_reason": "max_iterations",
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "model": provider_model_id,
-                    })
+                    yield _sse_frame(
+                        "assistant_done",
+                        {
+                            "stop_reason": "max_iterations",
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "model": provider_model_id,
+                        },
+                    )
                     break
 
         except (asyncio.CancelledError, GeneratorExit):
@@ -4288,8 +5265,11 @@ async def post_message_stream(
                     async with pool.acquire() as conn:
                         if not last_assistant_db:
                             await _insert_assistant_message(
-                                conn, tid, last_assistant_content,
-                                provider_model_id, last_assistant_tool_calls or None,
+                                conn,
+                                tid,
+                                last_assistant_content,
+                                provider_model_id,
+                                last_assistant_tool_calls or None,
                             )
                 except Exception:
                     pass
@@ -4302,15 +5282,24 @@ async def post_message_stream(
         finally:
             async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1", tid
+                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                    tid,
                 )
 
         # Auto-title on first exchange (fire and forget)
         if is_first_user_message and registry.has_any() and last_assistant_content:
-            asyncio.create_task(_auto_title_thread(
-                tid, req.content, last_assistant_content, provider, provider_model_id, pool,
-                user_id=user_id, project_id=pid,
-            ))
+            asyncio.create_task(
+                _auto_title_thread(
+                    tid,
+                    req.content,
+                    last_assistant_content,
+                    provider,
+                    provider_model_id,
+                    pool,
+                    user_id=user_id,
+                    project_id=pid,
+                )
+            )
 
     return StreamingResponse(
         _event_generator(),
@@ -4323,18 +5312,24 @@ async def post_message_stream(
 
 
 @router.post("/projects/{pid}/share/links")
-async def create_share_link(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def create_share_link(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         # `role` above is the caller's WORKSPACE role (owner/admin/member);
         # share_links.role is a SHARE role, and its CHECK only admits
@@ -4353,24 +5348,33 @@ async def create_share_link(pid: str, request: Request, payload: dict = Depends(
             VALUES ($1, $2, $3, $4)
             RETURNING *
             """,
-            pid, token, share_role, user_id,
+            pid,
+            token,
+            share_role,
+            user_id,
         )
         return dict(row)
 
 
 @router.get("/projects/{pid}/share/links")
-async def list_share_links(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def list_share_links(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             "SELECT * FROM share_links WHERE project_id = $1 ORDER BY created_at DESC",
@@ -4380,18 +5384,24 @@ async def list_share_links(pid: str, request: Request, payload: dict = Depends(r
 
 
 @router.delete("/projects/{pid}/share/links/{lid}")
-async def delete_share_link(pid: str, lid: str, request: Request, payload: dict = Depends(require_auth)):
+async def delete_share_link(
+    pid: str, lid: str, request: Request, payload: dict = Depends(require_auth)
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         # Confirm link belongs to this project (prevents IDOR across projects)
         await conn.execute(
@@ -4418,11 +5428,15 @@ async def list_revisions(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             """
@@ -4434,24 +5448,35 @@ async def list_revisions(
             ORDER BY fr.created_at DESC
             LIMIT $2
             """,
-            fid, limit,
+            fid,
+            limit,
         )
         return [dict(row) for row in rows]
 
 
 @router.get("/projects/{pid}/files/{fid}/revisions/{rid}")
-async def get_revision(pid: str, fid: str, rid: str, request: Request, payload: dict = Depends(require_auth)):
+async def get_revision(
+    pid: str,
+    fid: str,
+    rid: str,
+    request: Request,
+    payload: dict = Depends(require_auth),
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             """
@@ -4461,10 +5486,14 @@ async def get_revision(pid: str, fid: str, rid: str, request: Request, payload: 
             INNER JOIN files f ON f.id = fr.file_id
             WHERE fr.id = $1 AND fr.file_id = $2 AND f.project_id = $3
             """,
-            rid, fid, pid,
+            rid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="revision not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="revision not found"
+            )
 
         rev = dict(row)
         rev["content"] = ""
@@ -4472,7 +5501,13 @@ async def get_revision(pid: str, fid: str, rid: str, request: Request, payload: 
 
 
 @router.get("/projects/{pid}/files/{fid}/revisions/{rid}/content")
-async def get_revision_content(pid: str, fid: str, rid: str, request: Request, payload: dict = Depends(require_auth)):
+async def get_revision_content(
+    pid: str,
+    fid: str,
+    rid: str,
+    request: Request,
+    payload: dict = Depends(require_auth),
+):
     """
     Return the full reconstructed content for a single revision.
 
@@ -4489,11 +5524,15 @@ async def get_revision_content(pid: str, fid: str, rid: str, request: Request, p
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         # Verify the revision belongs to this file/project before fetching.
         exists = await conn.fetchval(
@@ -4502,36 +5541,54 @@ async def get_revision_content(pid: str, fid: str, rid: str, request: Request, p
             INNER JOIN files f ON f.id = fr.file_id
             WHERE fr.id = $1 AND fr.file_id = $2 AND f.project_id = $3
             """,
-            rid, fid, pid,
+            rid,
+            fid,
+            pid,
         )
         if not exists:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="revision not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="revision not found"
+            )
 
     # Reconstruct outside the connection-borrow (may walk a diff chain via
     # multiple fetchrow calls; that's fine — pool handles concurrency).
-    from kerf_core.revisions import reconstruct_revision as _reconstruct
     import uuid as _uuid
+
+    from kerf_core.revisions import reconstruct_revision as _reconstruct
+
     content = await _reconstruct(pool, _uuid.UUID(str(rid)))
     return {"id": rid, "content": content}
 
 
 @router.post("/projects/{pid}/files/{fid}/revisions/{rid}/restore")
-async def restore_revision(pid: str, fid: str, rid: str, request: Request, payload: dict = Depends(require_auth)):
+async def restore_revision(
+    pid: str,
+    fid: str,
+    rid: str,
+    request: Request,
+    payload: dict = Depends(require_auth),
+):
     user_id = payload.get("sub")
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot restore revisions")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot restore revisions",
+            )
 
         await conn.execute(
             "UPDATE files SET deleted_at = null, updated_at = now() WHERE id = $1 AND project_id = $2",
-            fid, pid,
+            fid,
+            pid,
         )
         return {"status": "restored"}
 
@@ -4567,11 +5624,15 @@ async def get_revisions_size(pid: str, payload: dict = Depends(require_auth)):
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         rows = await conn.fetch(
             """
@@ -4644,13 +5705,19 @@ async def purge_project_revisions_route(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot purge revisions")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot purge revisions",
+            )
 
     from kerf_core.revisions import purge_project_revisions as _purge
+
     result = await _purge(pool, pid, keep_last_per_file=keep_last)
     return result
 
@@ -4692,37 +5759,54 @@ async def init_upload(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload"
+            )
 
         try:
             req = InitUploadRequest(**await read_json_body(request))
         except Exception:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body"
+            )
 
         req.filename = req.filename.strip()
         req.sha256 = req.sha256.strip().lower()
         if not req.filename:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="filename required")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="filename required"
+            )
         if req.size <= 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="size must be > 0")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="size must be > 0"
+            )
         if settings.step_max_bytes > 0 and req.size > settings.step_max_bytes:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=f"file too large (> {settings.step_max_bytes} bytes)",
             )
         if len(req.sha256) != 64:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sha256 must be a 64-char hex digest")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="sha256 must be a 64-char hex digest",
+            )
 
         try:
             int(req.sha256, 16)
         except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sha256 must be hex")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="sha256 must be hex"
+            )
 
         chunk_size = settings.upload_chunk_size
         if chunk_size <= 0:
@@ -4739,10 +5823,15 @@ async def init_upload(
             order by created_at desc
             limit 1
             """,
-            pid, req.sha256,
+            pid,
+            req.sha256,
         )
         if existing:
-            received = [int(x) for x in existing["received_chunks"]] if existing["received_chunks"] else []
+            received = (
+                [int(x) for x in existing["received_chunks"]]
+                if existing["received_chunks"]
+                else []
+            )
             return {
                 "upload_id": str(existing["id"]),
                 "chunk_size": chunk_size,
@@ -4801,21 +5890,31 @@ async def put_chunk(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload"
+            )
 
         try:
             uuid.UUID(uid)
         except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id"
+            )
 
         if n < 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid chunk index")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid chunk index"
+            )
 
         row = await conn.fetchrow(
             """
@@ -4828,26 +5927,40 @@ async def put_chunk(
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upload not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="upload not found"
+            )
 
         if row["complete"]:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="upload already complete")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="upload already complete"
+            )
         if n >= row["total_chunks"]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="chunk index out of range")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="chunk index out of range",
+            )
 
         if row["expires_at"] < datetime.utcnow():
-            raise HTTPException(status_code=status.HTTP_410_GONE, detail="upload expired")
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE, detail="upload expired"
+            )
 
         storage = get_storage_required()
 
         chunk_slack = row["chunk_size"] + 64 * 1024
         body = await request.body()
         if len(body) > chunk_slack:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="chunk too large")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="chunk too large"
+            )
 
         await storage.put_chunk(
-            row["storage_key"], n, io.BytesIO(body),
-            conn=conn, session_id=row["id"],
+            row["storage_key"],
+            n,
+            io.BytesIO(body),
+            conn=conn,
+            session_id=row["id"],
         )
 
         received_chunks = list(row["received_chunks"]) if row["received_chunks"] else []
@@ -4884,18 +5997,26 @@ async def get_upload(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload"
+            )
 
         try:
             uuid.UUID(uid)
         except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id"
+            )
 
         row = await conn.fetchrow(
             """
@@ -4908,12 +6029,18 @@ async def get_upload(
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upload not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="upload not found"
+            )
 
         if row["expires_at"] < datetime.utcnow():
-            raise HTTPException(status_code=status.HTTP_410_GONE, detail="upload expired")
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE, detail="upload expired"
+            )
 
-        received = [int(x) for x in row["received_chunks"]] if row["received_chunks"] else []
+        received = (
+            [int(x) for x in row["received_chunks"]] if row["received_chunks"] else []
+        )
         return {
             "upload_id": str(row["id"]),
             "received_chunks": received,
@@ -4941,18 +6068,26 @@ async def finalize_upload(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload"
+            )
 
         try:
             uuid.UUID(uid)
         except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id"
+            )
 
         row = await conn.fetchrow(
             """
@@ -4965,9 +6100,13 @@ async def finalize_upload(
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upload not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="upload not found"
+            )
 
-        received_chunks = [int(x) for x in row["received_chunks"]] if row["received_chunks"] else []
+        received_chunks = (
+            [int(x) for x in row["received_chunks"]] if row["received_chunks"] else []
+        )
         if len(received_chunks) != row["total_chunks"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -4980,52 +6119,72 @@ async def finalize_upload(
             try:
                 req = FinalizeUploadRequest(**json.loads(req_body))
             except Exception:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="invalid body"
+                )
             if req.kind and req.kind != "step":
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="only kind='step' is supported")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="only kind='step' is supported",
+                )
             if req.parent_id:
                 try:
                     uuid.UUID(req.parent_id)
                 except ValueError:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid parent_id")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="invalid parent_id",
+                    )
                 parent_row = await conn.fetchrow(
                     "select kind from files where id = $1 and project_id = $2 and deleted_at is null",
                     uuid.UUID(req.parent_id),
                     uuid.UUID(pid),
                 )
                 if not parent_row:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="parent not found")
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND, detail="parent not found"
+                    )
                 if parent_row["kind"] != "folder":
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="parent must be a folder")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="parent must be a folder",
+                    )
                 parent_id = req.parent_id
 
         storage = get_storage_required()
 
         final_key = f"projects/{pid}/assets/{uuid.uuid4()}-{row['filename']}"
         size = await storage.concat_chunks_to(
-            row["storage_key"], final_key,
-            conn=conn, session_id=row["id"],
+            row["storage_key"],
+            final_key,
+            conn=conn,
+            session_id=row["id"],
         )
 
         mime_type = row["mime"] or "model/step"
 
-        is_step_mime = (mime_type or '').startswith('model/')
-        is_step_ext = row['filename'].lower().endswith(('.step', '.stp'))
+        is_step_mime = (mime_type or "").startswith("model/")
+        is_step_ext = row["filename"].lower().endswith((".step", ".stp"))
         if size > LARGE_STEP_THRESHOLD and (is_step_mime or is_step_ext):
             blob_io, _ = await storage.get(final_key)
             blob_bytes = blob_io.read()
             sha256_hex = hashlib.sha256(blob_bytes).hexdigest()
-            blob_key = f'blobs/step/{sha256_hex}'
+            blob_key = f"blobs/step/{sha256_hex}"
             await storage.put(blob_key, io.BytesIO(blob_bytes), mime_type, size)
             await storage.delete(final_key)
-            ref_data = {'hash': sha256_hex, 'size': size, 'original_name': row['filename'], 'mime': mime_type}
+            ref_data = {
+                "hash": sha256_hex,
+                "size": size,
+                "original_name": row["filename"],
+                "mime": mime_type,
+            }
             ref_json = json.dumps(ref_data)
-            base_name = row['filename']
-            for ext in ('.step', '.stp', '.STEP', '.STP'):
+            base_name = row["filename"]
+            for ext in (".step", ".stp", ".STEP", ".STP"):
                 if base_name.endswith(ext):
-                    base_name = base_name[:-len(ext)]
+                    base_name = base_name[: -len(ext)]
                     break
-            ref_name = base_name + '.step-ref'
+            ref_name = base_name + ".step-ref"
             f = await conn.fetchrow(
                 """
                 insert into files(project_id, parent_id, name, kind, content, storage_key, mime_type, size)
@@ -5039,7 +6198,9 @@ async def finalize_upload(
                 len(ref_json.encode()),
             )
             await storage.delete_upload(row["storage_key"])
-            await conn.execute("delete from upload_sessions where id = $1", uuid.UUID(uid))
+            await conn.execute(
+                "delete from upload_sessions where id = $1", uuid.UUID(uid)
+            )
             if settings.usage_enabled and size > 0:
                 await usage_queries.record_storage(conn, uid, pid, size)
             try:
@@ -5047,7 +6208,9 @@ async def finalize_upload(
             except Exception:
                 pass
             result = dict(f)
-            result["download_url"] = f"/api/projects/{pid}/files/{result['id']}/download"
+            result["download_url"] = (
+                f"/api/projects/{pid}/files/{result['id']}/download"
+            )
             return result
 
         f = await conn.fetchrow(
@@ -5085,7 +6248,9 @@ async def finalize_upload(
 
         result = dict(f)
         if result.get("storage_key"):
-            result["download_url"] = f"/api/projects/{pid}/files/{result['id']}/download"
+            result["download_url"] = (
+                f"/api/projects/{pid}/files/{result['id']}/download"
+            )
         return result
 
 
@@ -5102,18 +6267,26 @@ async def cancel_upload(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload"
+            )
 
         try:
             uuid.UUID(uid)
         except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="invalid upload id"
+            )
 
         row = await conn.fetchrow(
             """
@@ -5126,7 +6299,9 @@ async def cancel_upload(
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upload not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="upload not found"
+            )
 
         storage = get_storage_required()
         await storage.delete_upload(row["storage_key"])
@@ -5166,12 +6341,13 @@ def slugify_name(name: str) -> str:
 @dataclass
 class _FileRecord:
     """Normalised file record used by materialize_project_tree."""
+
     id: str
     parent_id: Optional[str]
     name: str
     kind: str
-    content: str          # inline text content (may be empty when storage_key is set)
-    storage_key: Optional[str]   # object-store key; set → blob, None → inline
+    content: str  # inline text content (may be empty when storage_key is set)
+    storage_key: Optional[str]  # object-store key; set → blob, None → inline
     mime_type: Optional[str]
     size: Optional[int]
 
@@ -5183,6 +6359,7 @@ class MaterializeTreeResult:
     zip_bytes: raw bytes of the self-contained ZIP archive.
     manifest:  the kerf-manifest.json dict (also embedded in the archive).
     """
+
     zip_bytes: bytes
     manifest: dict
 
@@ -5311,23 +6488,31 @@ async def materialize_project_tree(
                 entry["size"] = rec.size
             if rec.storage_key not in seen_blob_key:
                 seen_blob_key.add(rec.storage_key)
-                pendings.append({
-                    "zip_path": rel,
-                    "blob_key": rec.storage_key,
-                    "content_bytes": None,
-                })
+                pendings.append(
+                    {
+                        "zip_path": rel,
+                        "blob_key": rec.storage_key,
+                        "content_bytes": None,
+                    }
+                )
         else:
             # Inline — content column holds the text.
-            content_bytes = rec.content.encode("utf-8") if isinstance(rec.content, str) else (rec.content or b"")
+            content_bytes = (
+                rec.content.encode("utf-8")
+                if isinstance(rec.content, str)
+                else (rec.content or b"")
+            )
             oid = hashlib.sha256(content_bytes).hexdigest()
             entry["classification"] = "inline"
             entry["oid"] = oid
             entry["size"] = len(content_bytes)
-            pendings.append({
-                "zip_path": rel,
-                "blob_key": None,
-                "content_bytes": content_bytes,
-            })
+            pendings.append(
+                {
+                    "zip_path": rel,
+                    "blob_key": None,
+                    "content_bytes": content_bytes,
+                }
+            )
 
         manifest_files.append(entry)
 
@@ -5342,7 +6527,10 @@ async def materialize_project_tree(
             # Update the manifest entry with the real sha256 oid and size.
             oid = hashlib.sha256(blob_bytes).hexdigest()
             for me in manifest_files:
-                if me.get("classification") == "blob" and me.get("oid") == p["blob_key"]:
+                if (
+                    me.get("classification") == "blob"
+                    and me.get("oid") == p["blob_key"]
+                ):
                     me["oid"] = oid
                     me["size"] = len(blob_bytes)
                     break
@@ -5403,7 +6591,9 @@ async def export_project(
     pid: str,
     payload: dict = Depends(require_auth),
     # R14: per-user rate limit — 20 exports per hour
-    _rl: None = Depends(rate_limit(max_per_window=20, window_seconds=3600, key_prefix="api:export")),
+    _rl: None = Depends(
+        rate_limit(max_per_window=20, window_seconds=3600, key_prefix="api:export")
+    ),
 ):
     uid = payload.get("sub")
 
@@ -5411,11 +6601,15 @@ async def export_project(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             """
@@ -5426,7 +6620,9 @@ async def export_project(
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         name = row["name"]
         description = row["description"]
@@ -5493,7 +6689,9 @@ async def export_project(
                     bytes_delta=bytes_sent,
                 )
         except Exception as _eg_exc:
-            _logger.warning("egress: failed to record export usage — uid=%s: %s", uid, _eg_exc)
+            _logger.warning(
+                "egress: failed to record export usage — uid=%s: %s", uid, _eg_exc
+            )
 
     slug = slugify_name(name)
     short = pid[:8]
@@ -5519,6 +6717,7 @@ async def export_project(
 # The project-level route is the "download the whole project as a 3DM" action
 # that mirrors Rhino's "Save As .3dm" from within the kerf UI.
 
+
 @router.get("/projects/{pid}/export-3dm")
 async def export_project_3dm(
     request: Request,
@@ -5539,18 +6738,24 @@ async def export_project_3dm(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "select name from projects where id = $1",
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         project_name = row["name"] or "export"
 
@@ -5584,13 +6789,16 @@ async def export_project_3dm(
     # Attempt export via kerf_imports.export_3dm (full rhino3dm path).
     try:
         from kerf_imports.export_3dm import export_to_3dm  # type: ignore[import]
+
         three_dm_bytes: bytes = export_to_3dm(objects)
     except ImportError:
         # Fall back to write_3dm minimal writer via a temp file.
         try:
-            import tempfile
             import os
+            import tempfile
+
             from kerf_cad_core.geom.io.rhino3dm import write_3dm  # type: ignore[import]
+
             with tempfile.NamedTemporaryFile(suffix=".3dm", delete=False) as tf:
                 tmp_path = tf.name
             try:
@@ -5621,6 +6829,7 @@ async def export_project_3dm(
     filename = f"{slug}-{short}.3dm"
 
     from fastapi.responses import Response as _FastAPIResponse
+
     return _FastAPIResponse(
         content=three_dm_bytes,
         media_type="model/vnd.3dm",
@@ -5647,33 +6856,48 @@ async def upload_project_thumbnail(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewers cannot upload thumbnails")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewers cannot upload thumbnails",
+            )
 
         form = await request.form()
         file = form.get("file")
         if not file:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="missing 'file' field")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="missing 'file' field"
+            )
 
         content = await file.read()
         if len(content) > THUMB_MAX_BYTES:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="thumbnail too large (>512KB)")
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="thumbnail too large (>512KB)",
+            )
 
         storage = get_storage_required()
 
         try:
-            from PIL import Image
             import io as pil_io
+
+            from PIL import Image
 
             img = Image.open(pil_io.BytesIO(content))
             w, h = img.size
             if w == 0 or h == 0:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="zero-pixel image")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="zero-pixel image"
+                )
 
             if w > THUMB_TARGET_DIM or h > THUMB_TARGET_DIM:
                 ratio = THUMB_TARGET_DIM / max(w, h)
@@ -5687,7 +6911,10 @@ async def upload_project_thumbnail(
         except ImportError:
             jpg_bytes = content
         except Exception as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"decode/resize: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"decode/resize: {str(e)}",
+            )
 
         key = f"projects/{pid}/thumbnail.jpg"
         # Thumbnails stay in the PRIVATE bucket — they're served via the
@@ -5713,7 +6940,9 @@ async def upload_project_thumbnail(
         return {
             "id": pid,
             "thumbnail_url": f"/api/projects/{pid}/thumbnail",
-            "updated_at": row["thumbnail_updated_at"].isoformat() if row else now.isoformat(),
+            "updated_at": row["thumbnail_updated_at"].isoformat()
+            if row
+            else now.isoformat(),
         }
 
 
@@ -5734,15 +6963,21 @@ async def serve_project_cover(
             uuid.UUID(pid),
         )
         if not proj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         if proj["visibility"] != "public":
             uid = auth.get("sub") if auth else None
             if not uid:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+                )
             role = await get_user_workspace_role(conn, str(proj["workspace_id"]), uid)
             if not role:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+                )
 
         # Workshop convention (files-in-repo): a project file named
         # cover.{png,jpg,jpeg,webp,gif} overrides the auto-generated cover.
@@ -5759,9 +6994,13 @@ async def serve_project_cover(
             """,
             uuid.UUID(pid),
         )
-        key = (override["storage_key"] if override else None) or proj.get("cover_storage_key")
+        key = (override["storage_key"] if override else None) or proj.get(
+            "cover_storage_key"
+        )
         if not key:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no cover available")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="no cover available"
+            )
 
     storage = get_storage_required()
     body, content_type = await storage.get(key)
@@ -5789,19 +7028,27 @@ async def serve_project_thumbnail(
             uuid.UUID(pid),
         )
         if not proj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         if proj["visibility"] != "public":
             uid = auth.get("sub") if auth else None
             if not uid:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+                )
             role = await get_user_workspace_role(conn, str(proj["workspace_id"]), uid)
             if not role:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+                )
 
         key = proj.get("thumbnail_storage_key")
         if not key:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no thumbnail available")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="no thumbnail available"
+            )
 
     storage = get_storage_required()
     try:
@@ -5836,7 +7083,9 @@ async def serve_project_blob(
     oid: str,
     auth: Optional[dict] = Depends(optional_auth),
     # R15: per-user/per-IP rate limit — 120 blob fetches per minute
-    _rl: None = Depends(rate_limit(max_per_window=120, window_seconds=60, key_prefix="api:blobs")),
+    _rl: None = Depends(
+        rate_limit(max_per_window=120, window_seconds=60, key_prefix="api:blobs")
+    ),
 ):
     """GET /api/projects/:pid/blobs/:oid — serve a content-addressed object.
 
@@ -5867,7 +7116,9 @@ async def serve_project_blob(
             proj_uuid,
         )
         if not proj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+            )
 
         if proj["visibility"] != "public":
             uid = auth.get("sub") if auth else None
@@ -5878,7 +7129,9 @@ async def serve_project_blob(
                 )
             role = await get_user_workspace_role(conn, str(proj["workspace_id"]), uid)
             if not role:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+                )
 
         # Verify the project actually references this oid; prevents cross-project
         # access even when the caller is a member of a different workspace.
@@ -5888,7 +7141,9 @@ async def serve_project_blob(
             proj_uuid,
         )
         if not ref_exists:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+            )
 
     storage = get_storage_required()
     key = blob_storage_key(oid)
@@ -5896,12 +7151,15 @@ async def serve_project_blob(
     # R15 (T-409): S3 backend → redirect to a presigned URL; avoids proxying
     # bytes through the app and reduces egress cost.
     from kerf_core.storage.s3 import S3Storage as _S3Storage
+
     if isinstance(storage, _S3Storage):
         try:
             presigned = await storage.signed_url(key, ttl_seconds=900)
         except Exception:
             _logger.exception("serve_project_blob: failed to presign oid=%s", oid)
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+            )
         return RedirectResponse(url=presigned, status_code=302)
 
     # Local / self-host fallback: stream bytes through the app.
@@ -5909,7 +7167,9 @@ async def serve_project_blob(
         body, content_type = await storage.get(key)
     except (FileNotFoundError, KeyError):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    return StreamingResponse(body, media_type=content_type or "application/octet-stream")
+    return StreamingResponse(
+        body, media_type=content_type or "application/octet-stream"
+    )
 
 
 # Avatar (avatar.go)
@@ -5926,29 +7186,40 @@ async def upload_avatar(
 ):
     uid = payload.get("sub")
     if not uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized"
+        )
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         form = await request.form()
         file = form.get("file")
         if not file:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="missing 'file' field")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="missing 'file' field"
+            )
 
         content = await file.read()
         if len(content) > AVATAR_MAX_BYTES:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="avatar too large (>1MB)")
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="avatar too large (>1MB)",
+            )
 
         storage = get_storage_required()
 
         try:
-            from PIL import Image
             import io as pil_io
+
+            from PIL import Image
 
             img = Image.open(pil_io.BytesIO(content))
             w, h = img.size
             if w <= 0 or h <= 0:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="image has zero dimension")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="image has zero dimension",
+                )
 
             dst_w, dst_h = w, h
             if w > AVATAR_TARGET_DIM or h > AVATAR_TARGET_DIM:
@@ -5967,12 +7238,17 @@ async def upload_avatar(
         except ImportError:
             jpg_bytes = content
         except Exception as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"decode/resize: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"decode/resize: {str(e)}",
+            )
 
         key = f"users/{uid}/avatar.jpg"
         # Avatars render as a direct <img src> (no auth-gated endpoint), so
         # they go to the public CDN bucket. Everything else stays private.
-        await storage.put_public(key, io.BytesIO(jpg_bytes), "image/jpeg", len(jpg_bytes))
+        await storage.put_public(
+            key, io.BytesIO(jpg_bytes), "image/jpeg", len(jpg_bytes)
+        )
 
         now = datetime.utcnow()
         public_url = storage.public_url(key, now)
@@ -5986,7 +7262,8 @@ async def upload_avatar(
         # RETURNING can only name columns of the table being updated. Either
         # way every avatar upload 500'd, on every backend.
         prev_row = await conn.fetchrow(
-            "SELECT avatar_storage_key FROM users WHERE id = $1", uuid.UUID(uid))
+            "SELECT avatar_storage_key FROM users WHERE id = $1", uuid.UUID(uid)
+        )
         prev_key = prev_row["avatar_storage_key"] if prev_row else None
 
         row = await conn.fetchrow(
@@ -6005,7 +7282,9 @@ async def upload_avatar(
         )
 
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+            )
 
         if prev_key and prev_key != key:
             await storage.delete_public(prev_key)
@@ -6017,7 +7296,9 @@ async def upload_avatar(
             "avatar_url": row["avatar_url"] or "",
             "account_role": row["account_role"],
             "is_system": row["is_system"],
-            "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else row["created_at"],
+            "created_at": row["created_at"].isoformat()
+            if isinstance(row["created_at"], datetime)
+            else row["created_at"],
         }
 
 
@@ -6028,14 +7309,17 @@ async def delete_avatar(
 ):
     uid = payload.get("sub")
     if not uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized"
+        )
 
     pool = await get_pool_required()
     async with pool.acquire() as conn:
         # Same shape as the upload above, and it was broken the same way — see
         # the comment there. Read the key first, then clear it.
         prev_row = await conn.fetchrow(
-            "SELECT avatar_storage_key FROM users WHERE id = $1", uuid.UUID(uid))
+            "SELECT avatar_storage_key FROM users WHERE id = $1", uuid.UUID(uid)
+        )
         prev_key = prev_row["avatar_storage_key"] if prev_row else None
 
         row = await conn.fetchrow(
@@ -6052,7 +7336,9 @@ async def delete_avatar(
         )
 
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+            )
 
         if prev_key:
             # The upload writes to the public bucket (avatars render as a bare
@@ -6066,7 +7352,9 @@ async def delete_avatar(
             "avatar_url": row["avatar_url"] or "",
             "account_role": row["account_role"],
             "is_system": row["is_system"],
-            "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else row["created_at"],
+            "created_at": row["created_at"].isoformat()
+            if isinstance(row["created_at"], datetime)
+            else row["created_at"],
         }
 
 
@@ -6091,13 +7379,19 @@ async def list_distributors(
 ):
     uid = payload.get("sub")
     if not uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized"
+        )
 
     try:
         reg = get_registry()
         if reg is not None:
             metas = reg.meta()
-            return {"distributors": [vars(m) if hasattr(m, '__dict__') else m for m in metas]}
+            return {
+                "distributors": [
+                    vars(m) if hasattr(m, "__dict__") else m for m in metas
+                ]
+            }
     except Exception:
         pass
     return {"distributors": []}
@@ -6117,7 +7411,9 @@ async def update_distributor(
 ):
     uid = payload.get("sub")
     if not uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized"
+        )
 
     try:
         reg = get_registry()
@@ -6140,7 +7436,7 @@ async def update_distributor(
             return {"error": str(e)}
         meta = await reg.upsert(name, enabled, rate_limit, creds)
         await reg.reload()
-        return vars(meta) if hasattr(meta, '__dict__') else meta
+        return vars(meta) if hasattr(meta, "__dict__") else meta
     except Exception as e:
         return {"error": str(e)}
 
@@ -6153,7 +7449,9 @@ async def delete_distributor(
 ):
     uid = payload.get("sub")
     if not uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized"
+        )
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -6171,13 +7469,20 @@ async def refresh_part_distributors(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, uid)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         if role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot refresh distributors")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot refresh distributors",
+            )
 
         row = await conn.fetchrow(
             "select kind, content from files where id = $1 and project_id = $2 and deleted_at is null",
@@ -6185,15 +7490,20 @@ async def refresh_part_distributors(
             uuid.UUID(pid),
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
         if row["kind"] != "part":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file is not a Part")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="file is not a Part"
+            )
 
     try:
         reg = get_registry()
         if reg is not None:
             from kerf_api.distributors.sync import refresh_part
+
             new_content, n, _ = await refresh_part(pool, reg, row["content"])
             if n > 0:
                 async with pool.acquire() as conn2:
@@ -6223,10 +7533,15 @@ async def import_kicad_file(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot import files")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot import files",
+            )
 
     pyworker_url = os.getenv("PYWORKER_URL", "http://localhost:8090")
     content = await file.read()
@@ -6235,20 +7550,31 @@ async def import_kicad_file(
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
             resp = await client.post(
                 f"{pyworker_url}/import-kicad",
-                files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
+                files={
+                    "file": (
+                        file.filename,
+                        content,
+                        file.content_type or "application/octet-stream",
+                    )
+                },
             )
         if resp.status_code != 200:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                                detail=f"pyworker error: {resp.text[:300]}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"pyworker error: {resp.text[:300]}",
+            )
         data = resp.json()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
-                            detail=f"pyworker unreachable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"pyworker unreachable: {exc}",
+        )
 
     errors = data.get("errors") or []
     if errors:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            detail=errors[0])
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors[0]
+        )
 
     stem = file.filename.rsplit(".", 1)[0] if "." in file.filename else file.filename
     new_filename = f"{stem}.kicad.json"
@@ -6260,7 +7586,10 @@ async def import_kicad_file(
         await conn.execute(
             """INSERT INTO files (id, project_id, name, kind, content, created_at, updated_at)
                VALUES ($1, $2, $3, 'data', $4, NOW(), NOW())""",
-            uuid.UUID(new_file_id), uuid.UUID(pid), new_filename, circuit_content,
+            uuid.UUID(new_file_id),
+            uuid.UUID(pid),
+            new_filename,
+            circuit_content,
         )
 
     return {
@@ -6273,6 +7602,7 @@ async def import_kicad_file(
 # ---------------------------------------------------------------------------
 # Library endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.get("/library/parts")
 async def library_list_parts(
@@ -6349,7 +7679,9 @@ async def library_submit_part(
     user_id = uuid.UUID(auth["sub"])
     pool = await get_pool_required()
     async with pool.acquire() as conn:
-        ws = await workspaces_queries.get_workspace_by_slug(conn, body.target_workspace_slug)
+        ws = await workspaces_queries.get_workspace_by_slug(
+            conn, body.target_workspace_slug
+        )
         if not ws:
             raise HTTPException(status_code=404, detail="Target workspace not found")
 
@@ -6367,6 +7699,7 @@ async def library_submit_part(
 # Admin library submission routes
 # ---------------------------------------------------------------------------
 
+
 @router.get("/admin/library/submissions")
 async def admin_list_library_submissions(
     status_filter: Optional[str] = None,
@@ -6383,9 +7716,15 @@ async def admin_list_library_submissions(
     return {
         "rows": [
             {
-                **{k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()},
-                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
-                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                **{
+                    k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()
+                },
+                "created_at": row["created_at"].isoformat()
+                if row.get("created_at")
+                else None,
+                "updated_at": row["updated_at"].isoformat()
+                if row.get("updated_at")
+                else None,
             }
             for row in rows
         ]
@@ -6422,10 +7761,14 @@ async def admin_update_library_submission(
                 conn, sub_id, reviewer_id, body.review_note
             )
         else:
-            raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+            raise HTTPException(
+                status_code=400, detail="action must be 'approve' or 'reject'"
+            )
 
         if not updated:
-            raise HTTPException(status_code=404, detail="Submission not found or not in pending state")
+            raise HTTPException(
+                status_code=404, detail="Submission not found or not in pending state"
+            )
 
     return {"id": submission_id, "status": updated["status"]}
 
@@ -6434,8 +7777,11 @@ async def admin_update_library_submission(
 # Topology optimisation run
 # ---------------------------------------------------------------------------
 
+
 @router.post("/projects/{pid}/files/{fid}/topo/run")
-async def run_topo_proxy(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_topo_proxy(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """
     Forward the .topo file's JSON spec to the pyworker /run-topo route.
     Returns { job_id, status } or { status: 'pending' } when pyworker
@@ -6449,18 +7795,25 @@ async def run_topo_proxy(pid: str, fid: str, request: Request, payload: dict = D
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
         if row["kind"] != "topo":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -6478,6 +7831,7 @@ async def run_topo_proxy(pid: str, fid: str, request: Request, payload: dict = D
     pyworker_url = os.environ.get("PYWORKER_URL", "http://localhost:9090")
     try:
         import httpx as _httpx
+
         async with _httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
                 f"{pyworker_url}/run-topo",
@@ -6492,14 +7846,20 @@ async def run_topo_proxy(pid: str, fid: str, request: Request, payload: dict = D
     except _httpx.HTTPError:
         # Engine not yet deployed — return pending status so the UI can
         # show the ENGINE_PENDING warning instead of a hard error.
-        return {"status": "pending", "message": "Engine pending — FEniCSx not yet deployed."}
+        return {
+            "status": "pending",
+            "message": "Engine pending — FEniCSx not yet deployed.",
+        }
 
 
 # Wiring diagram run
 # ---------------------------------------------------------------------------
 
+
 @router.post("/projects/{pid}/files/{fid}/wiring/run")
-async def run_wiring(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_wiring(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """
     Forward the .wiring file's YAML source to the pyworker /run-wireviz route
     and return { svg, warnings }.
@@ -6512,18 +7872,25 @@ async def run_wiring(pid: str, fid: str, request: Request, payload: dict = Depen
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
         if row["kind"] != "wiring":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -6535,6 +7902,7 @@ async def run_wiring(pid: str, fid: str, request: Request, payload: dict = Depen
     pyworker_url = os.environ.get("PYWORKER_URL", "http://localhost:9090")
     try:
         import httpx as _httpx
+
         async with _httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{pyworker_url}/run-wireviz",
@@ -6560,8 +7928,11 @@ async def run_wiring(pid: str, fid: str, request: Request, payload: dict = Depen
 # Accepts POST /api/projects/{pid}/jewelry/metal-cost
 # The project_id is used only for access control (workspace membership check).
 
+
 @router.post("/projects/{pid}/jewelry/metal-cost")
-async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def jewelry_metal_cost(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """
     Estimate casting weight and cost for a jewelry piece.
 
@@ -6583,22 +7954,32 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
     try:
         body = await read_json_body(request)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid JSON body")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid JSON body"
+        )
 
     try:
         from kerf_cad_core.jewelry.metal_cost import (
-            casting_cost as _casting_cost,
-            multi_metal_compare as _multi_metal_compare,
             METAL_DENSITY_G_CM3,
             METAL_LABELS,
+        )
+        from kerf_cad_core.jewelry.metal_cost import (
+            casting_cost as _casting_cost,
+        )
+        from kerf_cad_core.jewelry.metal_cost import (
+            multi_metal_compare as _multi_metal_compare,
         )
     except ImportError as exc:
         raise HTTPException(
@@ -6608,13 +7989,21 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
 
     volume_mm3 = body.get("volume_mm3")
     if volume_mm3 is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="volume_mm3 is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="volume_mm3 is required"
+        )
     try:
         volume_mm3 = float(volume_mm3)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="volume_mm3 must be a number")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="volume_mm3 must be a number",
+        )
     if volume_mm3 <= 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="volume_mm3 must be positive")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="volume_mm3 must be positive",
+        )
 
     metal = body.get("metal")
     density_g_cm3 = body.get("density_g_cm3")
@@ -6629,9 +8018,15 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
         try:
             density_g_cm3 = float(density_g_cm3)
         except (TypeError, ValueError):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="density_g_cm3 must be a number")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="density_g_cm3 must be a number",
+            )
         if density_g_cm3 <= 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="density_g_cm3 must be positive")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="density_g_cm3 must be positive",
+            )
 
     if metal is None and density_g_cm3 is None:
         raise HTTPException(
@@ -6644,14 +8039,19 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
         try:
             v = float(val)
         except (TypeError, ValueError):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{name} must be a number")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{name} must be a number",
+            )
         if v < 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{name} must be >= 0")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"{name} must be >= 0"
+            )
         return v
 
-    metal_price_per_gram  = _float_param("metal_price_per_gram",  0.0)
-    labor                 = _float_param("labor",                  0.0)
-    finishing             = _float_param("finishing",              0.0)
+    metal_price_per_gram = _float_param("metal_price_per_gram", 0.0)
+    labor = _float_param("labor", 0.0)
+    finishing = _float_param("finishing", 0.0)
     casting_allowance_pct = _float_param("casting_allowance_pct", 15.0)
 
     try:
@@ -6674,7 +8074,10 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
     compare_metals = body.get("compare_metals")
     if compare_metals is not None:
         if not isinstance(compare_metals, list):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="compare_metals must be an array")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="compare_metals must be an array",
+            )
         unknown = [m for m in compare_metals if m not in METAL_DENSITY_G_CM3]
         if unknown:
             raise HTTPException(
@@ -6692,7 +8095,9 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
                 casting_allowance_pct=casting_allowance_pct,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            )
 
     return result
 
@@ -6701,8 +8106,11 @@ async def jewelry_metal_cost(pid: str, request: Request, payload: dict = Depends
 # Assembly clash detection — POST /api/projects/{pid}/files/{fid}/clash
 # ---------------------------------------------------------------------------
 
+
 @router.post("/projects/{pid}/files/{fid}/clash")
-async def run_clash_detect(pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)):
+async def run_clash_detect(
+    pid: str, fid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """
     Run OBB-SAT + BVH clash detection on the components of an assembly file.
 
@@ -6723,17 +8131,24 @@ async def run_clash_detect(pid: str, fid: str, request: Request, payload: dict =
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
         row = await conn.fetchrow(
             "SELECT kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
         if row["kind"] != "assembly":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -6806,6 +8221,7 @@ async def run_clash_detect(pid: str, fid: str, request: Request, payload: dict =
 # Part photo upload (T-310: rate-limited)
 # ---------------------------------------------------------------------------
 
+
 @router.post("/projects/{pid}/files/{fid}/photos", status_code=201)
 async def upload_part_photo(
     pid: str,
@@ -6813,7 +8229,9 @@ async def upload_part_photo(
     file: UploadFile,
     request: Request,
     payload: dict = Depends(require_auth),
-    _rl: None = Depends(rate_limit(max_per_window=60, window_seconds=60, key_prefix="api:photos")),
+    _rl: None = Depends(
+        rate_limit(max_per_window=60, window_seconds=60, key_prefix="api:photos")
+    ),
 ):
     """Upload a photo for a library Part file.
 
@@ -6829,23 +8247,33 @@ async def upload_part_photo(
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role or role == "viewer":
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="viewer cannot upload photos")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="viewer cannot upload photos",
+            )
 
         row = await conn.fetchrow(
             "SELECT id, kind, content FROM files WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-            fid, pid,
+            fid,
+            pid,
         )
         if not row:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="file not found"
+            )
 
     storage_inst = get_storage_required()
     content_bytes = await file.read()
     ext = (file.filename or "photo.jpg").rsplit(".", 1)[-1].lower()
     storage_key = f"photos/{pid}/{fid}/{uuid.uuid4()}.{ext}"
-    await storage_inst.put(storage_key, content_bytes, content_type=file.content_type or "image/jpeg")
+    await storage_inst.put(
+        storage_key, content_bytes, content_type=file.content_type or "image/jpeg"
+    )
 
     async with pool.acquire() as conn:
         # Parse existing content JSON; append new photo key.
@@ -6880,8 +8308,11 @@ async def upload_part_photo(
 #   export_idf — bool (default false)
 # Response: { totals, monthly, idf? }
 
+
 @router.post("/projects/{pid}/energy/building")
-async def building_energy_sim(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def building_energy_sim(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """Annual building energy simulation with optional EnergyPlus IDF export."""
     user_id = payload.get("sub")
 
@@ -6889,19 +8320,27 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
     try:
         body = await read_json_body(request)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid JSON body")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid JSON body"
+        )
 
     zones = body.get("zones") or []
     if not isinstance(zones, list) or len(zones) == 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="zones list is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="zones list is required"
+        )
 
     location = body.get("location") or {}
     hdd = float(location.get("hdd", 2700))
@@ -6909,8 +8348,18 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
     export_idf = bool(body.get("export_idf", False))
 
     MONTHS = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
     ]
     # Monthly HDD/CDD distribution (approximate Northern Hemisphere fractions)
     HDD_FRAC = [0.18, 0.15, 0.12, 0.07, 0.02, 0.00, 0.00, 0.00, 0.02, 0.07, 0.12, 0.17]
@@ -6918,10 +8367,10 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
 
     # Schedule occupancy fractions
     SCHED_HOURS = {
-        "office": 8 * 5 / (24 * 7),         # ~24% of week
+        "office": 8 * 5 / (24 * 7),  # ~24% of week
         "residential": 0.70,
-        "retail": 12 * 6 / (24 * 7),         # ~43%
-        "warehouse": 12 * 5 / (24 * 7),      # ~36%
+        "retail": 12 * 6 / (24 * 7),  # ~43%
+        "warehouse": 12 * 5 / (24 * 7),  # ~36%
     }
     SCHED_FRAC = {k: min(v, 1.0) for k, v in SCHED_HOURS.items()}
 
@@ -6933,8 +8382,13 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
     total_area = 0.0
 
     monthly = [
-        {"month": m, "heating_kWh": 0.0, "cooling_kWh": 0.0,
-         "lighting_kWh": 0.0, "equipment_kWh": 0.0}
+        {
+            "month": m,
+            "heating_kWh": 0.0,
+            "cooling_kWh": 0.0,
+            "lighting_kWh": 0.0,
+            "equipment_kWh": 0.0,
+        }
         for m in MONTHS
     ]
 
@@ -6956,16 +8410,18 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
         cop_c = max(float(zone.get("hvac_cop_cooling", 3.0)), 0.1)
 
         # UA total (W/K): walls + windows + infiltration
-        wall_area_est = 2 * (area ** 0.5 + area ** 0.5) * height  # perimeter × height proxy
+        wall_area_est = 2 * (area**0.5 + area**0.5) * height  # perimeter × height proxy
         ua_env = wall_area_est * wall_u + win_area * win_u
         ua_inf = volume * inf_ach * 1.2 * 1005 / 3600  # rho=1.2, cp=1005
         ua_total = ua_env + ua_inf
 
         # Internal gains (W)
-        internal_w = (lighting_wm2 + equip_wm2) * area * occ_frac + num_people * 75 * occ_frac
+        internal_w = (
+            lighting_wm2 + equip_wm2
+        ) * area * occ_frac + num_people * 75 * occ_frac
 
         # Degree-day energy: E = UA × DD × 24 / COP / 1000 (kWh)
-        wall_area_est = 2 * (area ** 0.5 + area ** 0.5) * height
+        wall_area_est = 2 * (area**0.5 + area**0.5) * height
         ua_env = wall_area_est * wall_u + win_area * win_u
         ua_inf = volume * inf_ach * 1.2 * 1005 / 3600
         ua_total = ua_env + ua_inf
@@ -6975,37 +8431,39 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
         zone_light = lighting_wm2 * area * occ_frac * 8760 / 1000
         zone_equip = equip_wm2 * area * occ_frac * 8760 / 1000
 
-        total_heating_kWh  += zone_heat
-        total_cooling_kWh  += zone_cool
+        total_heating_kWh += zone_heat
+        total_cooling_kWh += zone_cool
         total_lighting_kWh += zone_light
         total_equipment_kWh += zone_equip
-        total_area         += area
+        total_area += area
 
         # Monthly distribution
         for i, m in enumerate(monthly):
-            m["heating_kWh"]   += zone_heat  * HDD_FRAC[i]
-            m["cooling_kWh"]   += zone_cool  * CDD_FRAC[i]
-            m["lighting_kWh"]  += zone_light / 12
+            m["heating_kWh"] += zone_heat * HDD_FRAC[i]
+            m["cooling_kWh"] += zone_cool * CDD_FRAC[i]
+            m["lighting_kWh"] += zone_light / 12
             m["equipment_kWh"] += zone_equip / 12
 
-    annual_kWh = total_heating_kWh + total_cooling_kWh + total_lighting_kWh + total_equipment_kWh
+    annual_kWh = (
+        total_heating_kWh + total_cooling_kWh + total_lighting_kWh + total_equipment_kWh
+    )
     eui = annual_kWh / max(total_area, 1.0)
 
     result: dict = {
         "totals": {
-            "heating_kWh":   round(total_heating_kWh, 1),
-            "cooling_kWh":   round(total_cooling_kWh, 1),
-            "lighting_kWh":  round(total_lighting_kWh, 1),
+            "heating_kWh": round(total_heating_kWh, 1),
+            "cooling_kWh": round(total_cooling_kWh, 1),
+            "lighting_kWh": round(total_lighting_kWh, 1),
             "equipment_kWh": round(total_equipment_kWh, 1),
-            "annual_kWh":    round(annual_kWh, 1),
-            "eui_kWh_m2":    round(eui, 2),
+            "annual_kWh": round(annual_kWh, 1),
+            "eui_kWh_m2": round(eui, 2),
         },
         "monthly": [
             {
                 "month": m["month"],
-                "heating_kWh":   round(m["heating_kWh"], 1),
-                "cooling_kWh":   round(m["cooling_kWh"], 1),
-                "lighting_kWh":  round(m["lighting_kWh"], 1),
+                "heating_kWh": round(m["heating_kWh"], 1),
+                "cooling_kWh": round(m["cooling_kWh"], 1),
+                "lighting_kWh": round(m["lighting_kWh"], 1),
                 "equipment_kWh": round(m["equipment_kWh"], 1),
             }
             for m in monthly
@@ -7034,7 +8492,7 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
             "",
         ]
         for i, zone in enumerate(zones):
-            zname = zone.get("name", f"Zone_{i+1}").replace(" ", "_")
+            zname = zone.get("name", f"Zone_{i + 1}").replace(" ", "_")
             area = float(zone.get("floor_area_m2", 50))
             height = float(zone.get("height_m", 3.0))
             idf_lines += [
@@ -7067,8 +8525,11 @@ async def building_energy_sim(pid: str, request: Request, payload: dict = Depend
 #             mismatch_loss_pct, array_kWp, annual_yield_yr1_kWh,
 #             specific_yield_kWh_kWp, monthly_yield, per_module_gmpps }
 
+
 @router.post("/projects/{pid}/energy/pv-shading")
-async def pv_shading_sim(pid: str, request: Request, payload: dict = Depends(require_auth)):
+async def pv_shading_sim(
+    pid: str, request: Request, payload: dict = Depends(require_auth)
+):
     """PV partial-shading simulation with bypass-diode and MPPT mismatch loss."""
     """PV partial-shading simulation with latitude-aware TMY monthly yield."""
     user_id = payload.get("sub")
@@ -7077,22 +8538,29 @@ async def pv_shading_sim(pid: str, request: Request, payload: dict = Depends(req
     async with pool.acquire() as conn:
         ws_id = await project_workspace_id(pid)
         if not ws_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
         role = await get_user_workspace_role(conn, ws_id, user_id)
         if not role:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="project not found"
+            )
 
     try:
         body = await read_json_body(request)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid JSON body")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid JSON body"
+        )
 
     # Import the PV tools (kerf-cad-core must be installed)
     try:
-        from kerf_cad_core.solarpv.shading_tools import _parse_cell_params
         from kerf_cad_core.solarpv.shading import module_iv_shaded, mppt_global
+        from kerf_cad_core.solarpv.shading_tools import _parse_cell_params
         from kerf_cad_core.solarpv.sizing import energy_yield
         from kerf_cad_core.solarpv.tmy import monthly_yield_factors
+
         _pv_available = True
     except ImportError:
         _pv_available = False
@@ -7118,16 +8586,20 @@ async def pv_shading_sim(pid: str, request: Request, payload: dict = Depends(req
     latitude = float(body.get("latitude", 30.0))
 
     try:
-        params = _parse_cell_params({
-            "Iph": float(mod_spec.get("Iph", 9.0)),
-            "Io":  float(mod_spec.get("Io",  1.5e-10)),
-            "Rs":  float(mod_spec.get("Rs",  0.005)),
-            "Rsh": float(mod_spec.get("Rsh", 400)),
-            "n":   float(mod_spec.get("n",   1.3)),
-            "T_C": float(mod_spec.get("T_C", 25)),
-        })
+        params = _parse_cell_params(
+            {
+                "Iph": float(mod_spec.get("Iph", 9.0)),
+                "Io": float(mod_spec.get("Io", 1.5e-10)),
+                "Rs": float(mod_spec.get("Rs", 0.005)),
+                "Rsh": float(mod_spec.get("Rsh", 400)),
+                "n": float(mod_spec.get("n", 1.3)),
+                "T_C": float(mod_spec.get("T_C", 25)),
+            }
+        )
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"module params: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"module params: {exc}"
+        )
 
     # Build per-cell irradiance array from shading_pattern
     shading_pattern = body.get("shading_pattern") or []
@@ -7153,9 +8625,11 @@ async def pv_shading_sim(pid: str, request: Request, payload: dict = Depends(req
 
     try:
         module_curve = module_iv_shaded(
-            cell_irr, params,
+            cell_irr,
+            params,
             cells_per_bypass=cells_per_bypass,
-            bypass_fwd_v=eff_bypass_v, n_pts=n_pts,
+            bypass_fwd_v=eff_bypass_v,
+            n_pts=n_pts,
         )
         mod_mpp = mppt_global(module_curve)
         mod_gmpp_p = mod_mpp["gmpp_p"]
@@ -7166,9 +8640,11 @@ async def pv_shading_sim(pid: str, request: Request, payload: dict = Depends(req
         # For mismatch loss: compare with ideal (unshaded) module
         unshaded_irr = [1000.0] * n_cells
         unshaded_curve = module_iv_shaded(
-            unshaded_irr, params,
+            unshaded_irr,
+            params,
             cells_per_bypass=cells_per_bypass,
-            bypass_fwd_v=eff_bypass_v, n_pts=n_pts,
+            bypass_fwd_v=eff_bypass_v,
+            n_pts=n_pts,
         )
         unshaded_mpp = mppt_global(unshaded_curve)
         unshaded_gmpp_p = unshaded_mpp["gmpp_p"]
@@ -7196,8 +8672,20 @@ async def pv_shading_sim(pid: str, request: Request, payload: dict = Depends(req
         monthly_yield = [
             {"month": m, "yield_kWh": round(annual_yield_kWh * f, 1)}
             for m, f in zip(
-                ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+                [
+                    "Jan",
+                    "Feb",
+                    "Mar",
+                    "Apr",
+                    "May",
+                    "Jun",
+                    "Jul",
+                    "Aug",
+                    "Sep",
+                    "Oct",
+                    "Nov",
+                    "Dec",
+                ],
                 solar_frac,
             )
         ]

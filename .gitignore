@@ -105,3 +105,4 @@ packages/kerf-sdk-rs/Cargo.lock
 
 # Temp configs written by scripts/ts-check-file.mjs (deleted on exit; ignored in case of a crash)
 .tsconfig.check.*.json
+password.txt

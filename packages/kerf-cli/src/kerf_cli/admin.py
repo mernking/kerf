@@ -35,10 +35,10 @@ import os
 import sys
 import uuid
 
-
 # ---------------------------------------------------------------------------
 # repo-size
 # ---------------------------------------------------------------------------
+
 
 def _cmd_repo_size(args: argparse.Namespace) -> int:
     workspace_id_str = args.workspace.strip()
@@ -79,6 +79,7 @@ def _query_lfs_blob_bytes(workspace_id: uuid.UUID) -> int:
 
     try:
         import asyncio  # noqa: PLC0415
+
         import asyncpg  # noqa: PLC0415
 
         async def _query():
@@ -134,6 +135,7 @@ def _stat_packfile_bytes(workspace_id: uuid.UUID) -> int:
 # ---------------------------------------------------------------------------
 # Parser helpers (used from main.py)
 # ---------------------------------------------------------------------------
+
 
 def add_admin_parser(sub: "argparse._SubParsersAction") -> None:  # type: ignore[type-arg]
     """Register the ``admin`` subcommand group onto *sub*."""
@@ -212,8 +214,10 @@ def _cmd_set_password(args: "argparse.Namespace") -> int:
     import sys
 
     from kerf_core import node_credential
-    from kerf_core.db.config import default_database_url
-    from kerf_core.db.connection import get_pool
+
+    # from kerf_core.db.config import default_database_url
+    # from kerf_core.db.connection import get_pool
+    from kerf_core.db.connection import create_pool
 
     if args.generate:
         password = node_credential.suggest_password()
@@ -222,6 +226,7 @@ def _cmd_set_password(args: "argparse.Namespace") -> int:
     else:
         if sys.stdin.isatty():
             import getpass
+
             password = getpass.getpass("New node password: ")
         else:
             password = sys.stdin.readline().strip()
@@ -230,9 +235,22 @@ def _cmd_set_password(args: "argparse.Namespace") -> int:
         print("error: no password given", file=sys.stderr)
         return 2
 
+    # async def _run() -> int:
+    #     import os
+
+    #     pool = await get_pool()
+    #     try:
+    #         async with pool.acquire() as conn:
+    #             try:
+    #                 await node_credential.set_password(conn, password)
+    #             except ValueError as exc:
+    #                 print(f"error: {exc}", file=sys.stderr)
+    #                 return 2
+    #     finally:
+    #         await pool.close()
+    #     return 0
     async def _run() -> int:
-        import os
-        pool = await get_pool(os.environ.get("DATABASE_URL") or default_database_url())
+        pool = await create_pool()
         try:
             async with pool.acquire() as conn:
                 try:

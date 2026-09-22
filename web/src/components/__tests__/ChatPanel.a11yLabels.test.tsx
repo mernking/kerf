@@ -5,11 +5,10 @@
  *
  * Verifies:
  *  - The chat textarea carries aria-label="Chat message"
- *  - The model-picker listbox carries role="listbox" + aria-label
- *  - The trigger button carries aria-haspopup="listbox" + aria-expanded
+ *  - The model-picker modal carries role="dialog" + aria-label + aria-modal
+ *  - The trigger button carries aria-haspopup="dialog"
  *  - Each model option uses role="option" + aria-selected
- *  - aria-activedescendant is set on the listbox pointing at the active option
- *  - Option ids are derived from the model id (stable, sanitised)
+ *  - Option elements carry data-model-id for scroll-into-view
  */
 import { describe, it, expect } from 'vitest'
 import { readFileSync, existsSync } from 'fs'
@@ -28,17 +27,16 @@ describe('ChatPanel — T-B1 label chat input + model options', () => {
     expect(SRC).toMatch(/aria-label="Chat message"/)
   })
 
-  it('model listbox element has role="listbox"', () => {
-    // The open popover div should declare role="listbox"
-    expect(SRC).toMatch(/role="listbox"/)
+  it('model picker modal has role="dialog"', () => {
+    expect(SRC).toMatch(/role="dialog"/)
   })
 
-  it('model listbox has aria-label', () => {
+  it('model picker modal has aria-label', () => {
     expect(SRC).toMatch(/aria-label="Select model"/)
   })
 
-  it('model listbox carries aria-activedescendant linked to the active option id', () => {
-    expect(SRC).toMatch(/aria-activedescendant=\{activeOptionId\}/)
+  it('model picker modal carries aria-modal="true"', () => {
+    expect(SRC).toMatch(/aria-modal="true"/)
   })
 
   it('each model option uses role="option"', () => {
@@ -49,17 +47,12 @@ describe('ChatPanel — T-B1 label chat input + model options', () => {
     expect(SRC).toMatch(/aria-selected=\{active\}/)
   })
 
-  it('option id is derived from the sanitised model id', () => {
-    // e.g. `model-option-${m.id.replace(...)}`
-    expect(SRC).toMatch(/model-option-\$\{m\.id\.replace/)
+  it('option elements carry data-model-id for scroll-into-view', () => {
+    expect(SRC).toMatch(/data-model-id=\{m\.id\}/)
   })
 
-  it('trigger button has aria-haspopup="listbox"', () => {
-    expect(SRC).toMatch(/aria-haspopup="listbox"/)
-  })
-
-  it('trigger button has aria-expanded reflecting open state', () => {
-    expect(SRC).toMatch(/aria-expanded=\{open\}/)
+  it('trigger button has aria-haspopup="dialog"', () => {
+    expect(SRC).toMatch(/aria-haspopup="dialog"/)
   })
 
   it('trigger button aria-label includes the current model name', () => {

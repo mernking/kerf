@@ -58,7 +58,7 @@ function useClickOutside(ref: RefObject<HTMLElement | null>, onOutside: () => vo
   }, [ref, onOutside, enabled])
 }
 
-// ---------- model picker (popover) ----------
+// ---------- model picker (modal) ----------
 
 interface ModelPickerProps {
   models: ChatModel[]
@@ -69,36 +69,75 @@ interface ModelPickerProps {
 
 function ModelPicker({ models, selectedId, onSelect, disabled }: ModelPickerProps) {
   const [open, setOpen] = useState(false)
-  const wrapRef = useRef<HTMLDivElement>(null)
-  useClickOutside(wrapRef, () => setOpen(false), open)
+  const [query, setQuery] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
 
   const current = useMemo(() => models.find((m) => m.id === selectedId), [models, selectedId])
 
-  const grouped = useMemo(() => {
+  // Filter + group
+  const filtered = useMemo(() => {
+    const q = query.toLowerCase().trim()
+    const list = q
+      ? models.filter((m) =>
+          m.id.toLowerCase().includes(q) ||
+          m.label.toLowerCase().includes(q) ||
+          m.provider.toLowerCase().includes(q) ||
+          (PROVIDER_LABELS[m.provider] || m.provider).toLowerCase().includes(q)
+        )
+      : models
     const map = new Map<string, ChatModel[]>()
-    for (const m of models) {
+    for (const m of list) {
       if (!map.has(m.provider)) map.set(m.provider, [])
       map.get(m.provider)!.push(m)
     }
     return Array.from(map.entries())
-  }, [models])
+  }, [models, query])
+
+  const totalCount = filtered.reduce((n, [, ms]) => n + ms.length, 0)
+
+  const handleOpen = useCallback(() => {
+    setQuery('')
+    setOpen(true)
+  }, [])
+
+  // Focus search on open
+  useEffect(() => {
+    if (open) {
+      requestAnimationFrame(() => inputRef.current?.focus())
+    }
+  }, [open])
+
+  // Scroll selected into view
+  useEffect(() => {
+    if (!open || !selectedId) return
+    const safeId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(selectedId) : selectedId
+    const el = listRef.current?.querySelector(`[data-model-id="${safeId}"]`)
+    el?.scrollIntoView({ block: 'nearest' })
+  }, [open, selectedId])
+
+  // Keyboard: Escape closes, arrow keys navigate
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') { setOpen(false); return }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+    e.preventDefault()
+    const flat = filtered.flatMap(([, ms]) => ms)
+    const idx = flat.findIndex((m) => m.id === selectedId)
+    const next = e.key === 'ArrowDown'
+      ? flat[Math.min(idx + 1, flat.length - 1)]
+      : flat[Math.max(idx - 1, 0)]
+    if (next) onSelect(next.id)
+  }, [filtered, selectedId, onSelect])
 
   if (!models.length) return null
 
-  // Stable DOM id for aria-activedescendant (sanitise the model id for use as
-  // an HTML id — replace anything that isn't alphanumeric or dash/underscore).
-  const activeOptionId = selectedId
-    ? `model-option-${selectedId.replace(/[^a-zA-Z0-9_-]/g, '_')}`
-    : undefined
-
   return (
-    <div ref={wrapRef} className="relative">
+    <>
       <button
         type="button"
         disabled={disabled}
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
+        onClick={handleOpen}
+        aria-haspopup="dialog"
         aria-label={`Model: ${current?.label || 'pick model'}`}
         className="group inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-ink-700 bg-ink-900/80 text-[11px] font-mono text-ink-200 hover:bg-ink-800 hover:border-ink-600 disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kerf-300/70"
         title="Pick model"
@@ -110,45 +149,88 @@ function ModelPicker({ models, selectedId, onSelect, disabled }: ModelPickerProp
 
       {open && (
         <div
-          role="listbox"
+          role="dialog"
           aria-label="Select model"
-          aria-activedescendant={activeOptionId}
-          className="absolute bottom-full left-0 mb-1.5 z-30 w-64 rounded-lg border border-ink-700 bg-ink-900 shadow-2xl shadow-black/50 overflow-hidden"
+          aria-modal="true"
+          onKeyDown={handleKeyDown}
+          className="fixed inset-0 z-50 flex items-center justify-center"
         >
-          <div className="max-h-[60vh] overflow-auto py-1">
-            {grouped.map(([provider, ms]) => (
-              <div key={provider} className="py-1">
-                <div className="px-3 py-1 text-[10px] uppercase tracking-wider text-ink-500 font-semibold">
-                  {PROVIDER_LABELS[provider] || provider}
-                </div>
-                {ms.map((m) => {
-                  const active = m.id === selectedId
-                  const optionId = `model-option-${m.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
-                  return (
-                    <div
-                      key={m.id}
-                      id={optionId}
-                      role="option"
-                      aria-selected={active}
-                      onClick={() => { onSelect(m.id); setOpen(false) }}
-                      className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] font-mono cursor-pointer ${
-                        active ? 'bg-kerf-300/10 text-kerf-100' : 'text-ink-100 hover:bg-ink-800'
-                      }`}
-                    >
-                      <span className="flex-1 truncate">{m.label}</span>
-                      {m.is_default && !active && (
-                        <span className="text-[9px] uppercase tracking-wider text-ink-500">default</span>
-                      )}
-                      {active && <Check size={12} className="text-kerf-300" />}
-                    </div>
-                  )
-                })}
+          {/* backdrop */}
+          <div
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={() => setOpen(false)}
+          />
+          {/* panel */}
+          <div className="relative w-[520px] max-w-[92vw] max-h-[75vh] flex flex-col rounded-xl border border-ink-700 bg-ink-900 shadow-2xl shadow-black/60 overflow-hidden">
+            {/* header + search */}
+            <div className="flex items-center gap-3 px-4 pt-4 pb-2">
+              <Sparkles size={14} className="text-kerf-300 shrink-0" />
+              <h2 className="text-sm font-semibold text-ink-100">Select Model</h2>
+              <span className="ml-auto text-[10px] text-ink-500">{totalCount} models</span>
+            </div>
+            <div className="px-4 pb-3">
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-500" />
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search models..."
+                  className="w-full pl-8 pr-3 py-2 text-[13px] font-mono bg-ink-800 border border-ink-700 rounded-lg text-ink-100 placeholder:text-ink-500 outline-none focus:border-kerf-300/50 focus:ring-1 focus:ring-kerf-300/30 transition-colors"
+                />
+                {query && (
+                  <button
+                    type="button"
+                    onClick={() => setQuery('')}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-ink-700 text-ink-400 hover:text-ink-200"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
               </div>
-            ))}
+            </div>
+
+            {/* model list */}
+            <div ref={listRef} className="flex-1 overflow-y-auto px-2 pb-3">
+              {filtered.length === 0 && (
+                <div className="py-8 text-center text-[12px] text-ink-500">
+                  No models match &ldquo;{query}&rdquo;
+                </div>
+              )}
+              {filtered.map(([provider, ms]) => (
+                <div key={provider} className="mb-1">
+                  <div className="sticky top-0 z-10 px-2 py-1.5 text-[10px] uppercase tracking-wider text-ink-500 font-semibold bg-ink-900/95 backdrop-blur-sm">
+                    {PROVIDER_LABELS[provider] || provider}
+                  </div>
+                  {ms.map((m) => {
+                    const active = m.id === selectedId
+                    return (
+                      <div
+                        key={m.id}
+                        data-model-id={m.id}
+                        role="option"
+                        aria-selected={active}
+                        onClick={() => { onSelect(m.id); setOpen(false) }}
+                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-left text-[12px] font-mono cursor-pointer transition-colors ${
+                          active ? 'bg-kerf-300/10 text-kerf-100' : 'text-ink-100 hover:bg-ink-800'
+                        }`}
+                      >
+                        <span className="flex-1 break-all leading-snug">{m.label || m.id}</span>
+                        {m.is_default && !active && (
+                          <span className="text-[9px] uppercase tracking-wider text-ink-500 shrink-0 ml-2">default</span>
+                        )}
+                        {active && <Check size={12} className="text-kerf-300 shrink-0" />}
+                      </div>
+                    )
+                  })}
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
 

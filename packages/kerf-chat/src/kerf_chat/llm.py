@@ -539,11 +539,19 @@ class LiteLLMProvider(Provider):
         """Prefix a catalogue id for LiteLLM's router.
 
         CATALOG stores bare vendor ids ("claude-opus-4-7"); LiteLLM needs
-        "anthropic/claude-opus-4-7" to know where to send it. An id that is
-        already prefixed is left alone, so a user pointing base_url at a
-        gateway can name a model the catalogue has never heard of.
+        "anthropic/claude-opus-4-7" to know where to send it.
+
+        When ``base_url`` is set (a gateway / OpenAI-compatible endpoint),
+        ALWAYS prefix with "openai/" — LiteLLM requires a provider prefix
+        to detect the wire protocol, then strips it before sending to the
+        gateway.  So ``openai/auto/best-coding`` becomes ``auto/best-coding``
+        at the gateway.
         """
-        return model if "/" in model else f"{self.provider}/{model}"
+        if self.base_url:
+            return f"openai/{model}"
+        if "/" in model:
+            return model
+        return f"{self.provider}/{model}"
 
     def _use_cache(self) -> bool:
         return self.prompt_cache and self.provider in _PROMPT_CACHE_PROVIDERS

@@ -1189,6 +1189,95 @@ def _get_llm_registry() -> llm_module.Registry:
     )
 
 
+async def _user_has_byo_keys(pool, user_id: Optional[str]) -> bool:
+    """True when the user has saved at least one BYO provider key.
+
+    The operator may have configured zero API keys (no ANTHROPIC_API_KEY,
+    no OPENAI_API_KEY).  In that case ``registry.has_any()`` is False and
+    the chat gate would reject every message — even though the user
+    supplied their own key via POST /api/provider-keys.  This check
+    lets the gate pass so ``_prefer_byo_provider`` can swap in the BYO
+    key downstream.
+    """
+    if not user_id:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM user_provider_keys WHERE user_id = $1)",
+                user_id,
+            )
+        return bool(row)
+    except Exception:
+        return False
+
+
+async def _resolve_byo_provider(pool, user_id: Optional[str], model_id: str):
+    """Build a Provider from a BYO key when the operator has none configured."""
+    if not user_id:
+        _logger.info("byo_resolve: skip — no user_id for model=%s", model_id)
+        return None
+
+    byo_keys: dict[str, tuple[str, str]] = {}
+    try:
+        from kerf_core.utils.encrypt import decrypt_secret
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT provider, encrypted_key, base_url FROM user_provider_keys WHERE user_id = $1",
+                user_id,
+            )
+        for row in rows:
+            try:
+                api_key = decrypt_secret(row["encrypted_key"], "byo-provider-key").decode()
+                byo_keys[row["provider"]] = (api_key, row["base_url"] or "")
+            except Exception:
+                continue
+
+        if not byo_keys:
+            _logger.info("byo_resolve: no BYO keys saved for user=%s model=%s", user_id, model_id)
+            return None
+
+        # Fast path: model_id is provider-prefixed (e.g. "openai/gpt-4o").
+        if "/" in model_id:
+            provider_name = model_id.split("/", 1)[0]
+            if provider_name in _BYO_SUPPORTED_PROVIDERS and provider_name in byo_keys:
+                api_key, base_url = byo_keys[provider_name]
+                prov = _make_byo_provider(provider_name, api_key, base_url)
+                if prov is not None:
+                    _logger.info("byo_resolve: fast path provider=%s model=%s", provider_name, model_id)
+                    return prov, model_id
+
+        # Fallback: model prefix not a known provider (e.g. "auto/best-coding"
+        # from OmniRouter).  Try every saved BYO provider — the gateway routes
+        # the request to the right upstream.
+        for provider_name, (api_key, base_url) in byo_keys.items():
+            if provider_name in _BYO_SUPPORTED_PROVIDERS:
+                _logger.info("byo_resolve: fallback provider=%s model=%s base_url=%s", provider_name, model_id, base_url)
+                prov = _make_byo_provider(provider_name, api_key, base_url)
+                if prov is not None:
+                    return prov, model_id
+
+    except Exception as exc:
+        _logger.warning("byo_resolve: failed for %s: %s", model_id, exc)
+
+    _logger.warning("byo_resolve: no provider matched model=%s user=%s keys=%s", model_id, user_id, list(byo_keys.keys()))
+    return None
+
+
+def _make_byo_provider(provider_name: str, api_key: str, base_url: str):
+    """Instantiate a Provider from a BYO key + base_url."""
+    if provider_name == "anthropic":
+        return llm_module.AnthropicProvider(api_key, base_url=base_url)
+    if provider_name == "openai":
+        return llm_module.OpenAIProvider(api_key, base_url=base_url)
+    if provider_name == "moonshot":
+        return llm_module.MoonshotProvider(api_key, base_url=base_url)
+    if provider_name == "gemini":
+        return llm_module.GeminiProvider(api_key, base_url=base_url)
+    return None
+
+
 async def _prefer_byo_provider(pool, user_id: Optional[str], provider):
     """Swap in the user's own saved provider key when they have one.
 
@@ -4609,10 +4698,10 @@ async def post_message(
 
     registry = _get_llm_registry()
 
-    if not registry.has_any():
+    if not registry.has_any() and not await _user_has_byo_keys(pool, user_id):
         async with pool.acquire() as conn:
             assistant_msg = await _insert_assistant_message(
-                conn, tid, "LLM not configured — set ANTHROPIC_API_KEY", "none", None
+                conn, tid, "LLM not configured — set ANTHROPIC_API_KEY or add a provider key in Settings.", "none", None
             )
             await conn.execute(
                 "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
@@ -4628,23 +4717,26 @@ async def post_message(
         provider, provider_model_id = registry.resolve(chosen_model)
     except ValueError as e:
         _logger.warning(f"llm: resolve {chosen_model!r} failed: {e}")
-        async with pool.acquire() as conn:
-            assistant_msg = await _insert_assistant_message(
-                conn,
-                tid,
-                "That model isn't available right now. Try picking a different one from the model dropdown.",
-                "none",
-                None,
-            )
-            await conn.execute(
-                "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
-                tid,
-            )
-        return {
-            "user_message": user_msg,
-            "assistant_message": assistant_msg,
-            "tool_messages": [],
-        }
+        byo = await _resolve_byo_provider(pool, user_id, chosen_model)
+        if byo is None:
+            async with pool.acquire() as conn:
+                assistant_msg = await _insert_assistant_message(
+                    conn,
+                    tid,
+                    "That model isn't available right now. Try picking a different one from the model dropdown.",
+                    "none",
+                    None,
+                )
+                await conn.execute(
+                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                    tid,
+                )
+            return {
+                "user_message": user_msg,
+                "assistant_message": assistant_msg,
+                "tool_messages": [],
+            }
+        provider, provider_model_id = byo
 
     # Kerf is 100% free, self-hosted software — there is no credit/quota gate.
     # If the caller saved their own provider key (POST /api/provider-keys),
@@ -4967,11 +5059,11 @@ async def post_message_stream(
         # Emit the user_message id first so the client can anchor its UI.
         yield _sse_frame("user_message", {"id": str(user_msg["id"])})
 
-        if not registry.has_any():
+        if not registry.has_any() and not await _user_has_byo_keys(pool, user_id):
             yield _sse_frame(
                 "error",
                 {
-                    "message": "LLM not configured — set ANTHROPIC_API_KEY",
+                    "message": "LLM not configured — set ANTHROPIC_API_KEY or add a provider key in Settings.",
                     "is_error": True,
                 },
             )
@@ -4979,7 +5071,7 @@ async def post_message_stream(
                 await _insert_assistant_message(
                     conn,
                     tid,
-                    "LLM not configured — set ANTHROPIC_API_KEY",
+                    "LLM not configured — set ANTHROPIC_API_KEY or add a provider key in Settings.",
                     "none",
                     None,
                 )
@@ -4993,15 +5085,18 @@ async def post_message_stream(
             provider, provider_model_id = registry.resolve(chosen_model)
         except ValueError as e:
             _logger.warning(f"llm stream: resolve {chosen_model!r} failed: {e}")
-            msg = "That model isn't available right now. Try picking a different one from the model dropdown."
-            yield _sse_frame("error", {"message": msg, "is_error": True})
-            async with pool.acquire() as conn:
-                await _insert_assistant_message(conn, tid, msg, "none", None)
-                await conn.execute(
-                    "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
-                    tid,
-                )
-            return
+            byo = await _resolve_byo_provider(pool, user_id, chosen_model)
+            if byo is None:
+                msg = "That model isn't available right now. Try picking a different one from the model dropdown."
+                yield _sse_frame("error", {"message": msg, "is_error": True})
+                async with pool.acquire() as conn:
+                    await _insert_assistant_message(conn, tid, msg, "none", None)
+                    await conn.execute(
+                        "UPDATE chat_threads SET last_message_at = now(), updated_at = now() WHERE id = $1",
+                        tid,
+                    )
+                return
+            provider, provider_model_id = byo
 
         # Kerf is 100% free, self-hosted software — there is no credit/quota
         # gate. Prefer the caller's own saved provider key when present.
